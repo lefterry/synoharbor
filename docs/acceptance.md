@@ -117,3 +117,19 @@ The corrected package replaces live-directory tar with the existing consistent
 full-backup workflow. A brief package CGI maintenance window let the old script
 finish without editing installed lifecycle scripts. Upgrade completed, the
 private encryption key checksum matched, and the worker is running.
+
+## Shared Settings interface refinement
+
+- Settings is organized into General, DSM connection, Cloudflare, Standalone
+  access and Backup & recovery. Readable labels, descriptions and consistent
+  spacing replace the mixed-size card grid. Configured standalone access shows
+  an address/status summary; editing opens explicitly and Cancel discards drafts.
+- Local browser checks passed in light/dark themes at desktop and narrow
+  viewports. Category keyboard navigation, connection-dialog access, theme save,
+  older backup visibility and both typed restore guards were checked with mock
+  data. No live restore or credential mutation was performed for this UI change.
+- Shared frontend files were backed up and deployed without restarting services.
+  Backend binary and owned nginx configuration checksums were unchanged. The DSM
+  package path and standalone path returned identical HTML/JavaScript checksums.
+  All four service URLs returned 200 with valid TLS; anonymous management remains
+  401. The shared HTML also declares the existing SVG logo as its tab favicon.
