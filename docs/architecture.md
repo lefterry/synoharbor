@@ -11,10 +11,18 @@ durable operations, successful DSM snapshots and reserved loopback ports.
 Credentials are encrypted with AES-GCM using a package-private 0600 master key.
 ACME account/certificate files are held in private per-profile storage.
 
+Unsigned DSM 7.3 packages cannot declare root lifecycle privileges at install.
+The SPK installs as its package account; the administrator explicitly runs
+`scripts/activate` once after installation/upgrade (sudo or DSM Task Scheduler).
+Activation copies the checked broker into a root-owned libexec directory and
+installs a package-specific systemd dependency/drop-in. DSM starts/stops the
+immutable broker together with the package; SPK lifecycle scripts stay unprivileged. The UI displays activation status and the exact command.
+
 The root broker listens only on a 0660 Unix socket and checks the connecting
 process UID using SO_PEERCRED. It renders typed, validated host configurations;
-there is no arbitrary shell or file API. The binary and lifecycle scripts are
-root-owned and not writable by the package account.
+there is no arbitrary shell or file API. The broker binary in `/usr/local/libexec/synoharbor` and its systemd unit/drop-in
+are root-owned and not writable by the package account. DSM may reset package
+payload ownership at start; privileged execution never uses that mutable path.
 
 ```text
 client HTTPS → native DSM proxy/certificate → loopback Advanced listener

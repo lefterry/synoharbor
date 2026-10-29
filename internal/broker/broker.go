@@ -17,7 +17,6 @@ import (
 
 	"github.com/lefterry/synoharbor/internal/model"
 	"github.com/lefterry/synoharbor/internal/nginx"
-	"gopkg.in/yaml.v3"
 )
 
 const Socket = "/var/run/synoharbor-broker.sock"
@@ -224,6 +223,8 @@ func Serve(ctx context.Context, path string, uid, gid int, system *System) error
 }
 func (s *System) handle(ctx context.Context, r Request) (any, error) {
 	switch r.Action {
+	case "status":
+		return map[string]bool{"ready": true}, nil
 	case "apply":
 		return nil, s.Apply(ctx, r.Config)
 	case "http2":
@@ -234,11 +235,7 @@ func (s *System) handle(ctx context.Context, r Request) (any, error) {
 			return nil, errors.New("notification too long")
 		}
 		return nil, exec.CommandContext(ctx, "/usr/syno/bin/synodsmnotify", "@administrators", "SynoHarbor", r.Message).Run()
-	case "legacy-export":
-		return legacyExport()
-	case "legacy-stop":
-		return nil, exec.CommandContext(ctx, "/usr/syno/bin/synopkg", "stop", "dnsacme").Run()
-	case "native-certificate":
+	case "native-certificate", "native-certificate-info":
 		if !model.ValidID(r.ID) {
 			return nil, errors.New("invalid certificate ID")
 		}
@@ -246,6 +243,10 @@ func (s *System) handle(ctx context.Context, r Request) (any, error) {
 		cert, e := os.ReadFile(root + "/fullchain.pem")
 		if e != nil {
 			return nil, errors.New("native certificate chain unavailable")
+		}
+		if r.Action == "native-certificate-info" {
+			defaultID, _ := os.ReadFile("/usr/syno/etc/certificate/_archive/DEFAULT")
+			return map[string]string{"certificate": string(cert), "isDefault": strconv.FormatBool(strings.TrimSpace(string(defaultID)) == r.ID)}, nil
 		}
 		key, e := os.ReadFile(root + "/privkey.pem")
 		if e != nil {
@@ -255,41 +256,4 @@ func (s *System) handle(ctx context.Context, r Request) (any, error) {
 	default:
 		return nil, errors.New("broker action is not allowed")
 	}
-}
-
-// Fixed-source, one-way migration; no caller-controlled filesystem path. Secrets
-// travel only over the UID-checked Unix socket and never through the web API.
-func legacyExport() (any, error) {
-	const path = "/var/packages/dnsacme/etc/config.yaml"
-	raw, e := os.ReadFile(path)
-	if e != nil {
-		return nil, errors.New("DNSACME configuration unavailable")
-	}
-	var cfg struct {
-		ACME struct {
-			Domains []string `yaml:"domains"`
-			Email   string   `yaml:"email"`
-			KeyType string   `yaml:"keyType"`
-		} `yaml:"acme"`
-		DNS struct {
-			Provider string            `yaml:"provider"`
-			Config   map[string]string `yaml:"config"`
-		} `yaml:"dns"`
-		Synology struct {
-			Account  string `yaml:"account"`
-			Password string `yaml:"password"`
-			Port     int    `yaml:"port"`
-		} `yaml:"synology"`
-	}
-	if e = yaml.Unmarshal(raw, &cfg); e != nil {
-		return nil, errors.New("invalid legacy configuration")
-	}
-	token := cfg.DNS.Config["CLOUDFLARE_APITOKEN"]
-	if token == "" {
-		token = cfg.DNS.Config["CLOUDFLARE_API_TOKEN"]
-	}
-	if cfg.DNS.Provider != "cloudflare" || token == "" {
-		return nil, errors.New("legacy Cloudflare credential unavailable")
-	}
-	return map[string]any{"domains": cfg.ACME.Domains, "email": cfg.ACME.Email, "keyType": cfg.ACME.KeyType, "token": token, "account": cfg.Synology.Account, "password": cfg.Synology.Password, "port": cfg.Synology.Port}, nil
 }

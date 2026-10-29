@@ -233,6 +233,44 @@ func (c *Client) DeleteProxy(ctx context.Context, id string) error {
 func (c *Client) DeleteCertificate(ctx context.Context, id string) error {
 	return c.form(ctx, "SYNO.Core.Certificate.CRT", "delete", map[string]any{"ids": []string{id}}, nil)
 }
+
+func (c *Client) ReplaceBindings(ctx context.Context, oldID, newID string, asDefault bool) error {
+	snap, e := c.Snapshot(ctx)
+	if e != nil {
+		return e
+	}
+	settings := []map[string]any{}
+	for _, cert := range snap.Certificates {
+		if ID(cert) != oldID {
+			continue
+		}
+		services, _ := cert["services"].([]any)
+		for _, item := range services {
+			service, _ := item.(map[string]any)
+			if service != nil {
+				settings = append(settings, map[string]any{"service": service, "old_id": oldID, "id": newID})
+			}
+		}
+	}
+	if len(settings) > 0 {
+		if e = c.form(ctx, "SYNO.Core.Certificate.Service", "set", map[string]any{"settings": settings}, nil); e != nil {
+			return e
+		}
+	}
+	if asDefault {
+		desc := ""
+		for _, cert := range snap.Certificates {
+			if ID(cert) == newID {
+				desc = String(cert, "desc")
+			}
+		}
+		if desc == "" {
+			return errors.New("replacement certificate description unavailable")
+		}
+		return c.form(ctx, "SYNO.Core.Certificate.CRT", "set", map[string]any{"id": newID, "desc": desc, "as_default": true}, nil)
+	}
+	return nil
+}
 func Fingerprint(certPEM []byte) (string, *x509.Certificate, error) {
 	b, _ := pem.Decode(certPEM)
 	if b == nil {
@@ -335,5 +373,15 @@ func (c *Client) HTTP2(ctx context.Context) (bool, error) {
 	return enabled, nil
 }
 func (c *Client) SetHTTP2(ctx context.Context, enabled bool) error {
-	return c.form(ctx, "SYNO.Core.Web.DSM", "set", map[string]any{"version": "2", "enable_spdy": enabled}, nil)
+	var current map[string]any
+	if e := c.form(ctx, "SYNO.Core.Web.DSM", "get", map[string]any{"version": "2"}, &current); e != nil {
+		return e
+	}
+	params := map[string]any{"version": "2", "enable_spdy": enabled}
+	for _, key := range []string{"enable_max_connections", "max_connections", "enable_server_header", "server_header", "enable_reuseport"} {
+		if v, ok := current[key]; ok {
+			params[key] = v
+		}
+	}
+	return c.form(ctx, "SYNO.Core.Web.DSM", "set", params, nil)
 }

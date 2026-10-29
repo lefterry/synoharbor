@@ -3,7 +3,7 @@
 Status: development and live validation in progress (2026-10-29).
 
 - Existing DNSACME authentication prerequisite: fixed in upstream PR #114,
-  commit 5fd54c2. Package 1.0.9-18 / UI120 installed on DS918+ after private backup.
+  commits 5fd54c2 and 6844d62. Package 1.0.9-19 / UI121 installed on DS918+ after private backup.
   Native-helper authenticated bootstrap/read passed, invalid CSRF and anonymous
   calls were rejected; real anonymous HTTP config request returns 401. Settings,
   trusted device, ACME account key and certificate/key checksums were preserved.
@@ -12,8 +12,12 @@ Status: development and live validation in progress (2026-10-29).
   restart persistence, edit conflicts, interrupted operations, advanced rules,
   snippet isolation, Basic Auth compatibility and invalid-nginx rollback.
 - Full race/vet and final SPK checks: pending latest revision.
-- Native SynoHarbor install/browser workflow: pending.
-- Four independent profiles and direct-NAS HTTPS migration: pending.
+- Native SPK install, explicit immutable broker activation and the real DSM browser
+  trusted-device workflow passed. The user confirmed Trusted device ready.
+  Root broker ownership is root:root outside mutable package paths.
+- Three services remain in scope after the user removed Kopia. DSM, Plex and
+  qBittorrent answer directly on the NAS with trusted SSL. DSM Force SSL returned
+  308. Plex/qBittorrent are being rechecked after native asynchronous reloads.
 - Live native edits/deletes, renewal/retry, all Advanced settings, restart and
   upgrade/backup preservation: pending.
 - ARM64 SPK build planned; live ARM64 validation not claimed.
@@ -22,11 +26,10 @@ Initial migration targets:
 
 | Host | Target | Certificate action |
 | --- | --- | --- |
-| syno.example.net | HTTPS 127.0.0.1:5001 | Adopt existing native certificate |
-| kp.syno.example.net | HTTPS 127.0.0.1:51515 | Issue independent certificate |
+| syno.example.net | HTTPS 127.0.0.1:5001 | Fresh replacement requested after initial adoption |
 | plex.syno.example.net | HTTP 127.0.0.1:32400 | Issue independent certificate |
 | qbit.syno.example.net | HTTP 127.0.0.1:8095 | Issue independent certificate |
 
-The Kopia upstream requires explicit trust for its self-signed certificate. The
+Kopia was removed from the requested scope by the user on 2026-10-29. The
 DSM upstream uses its certificate hostname for verification. DNSACME must keep
 managing syno until SynoHarbor renewal adoption and deployment are verified.

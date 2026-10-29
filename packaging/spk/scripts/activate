@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+umask 077
+[ "$(id -u)" = 0 ] || { printf '%s\n' 'Run activation as root via sudo or DSM Task Scheduler.' >&2; exit 1; }
+# DSM may reset ownership of package payloads at start. Keep privileged code in
+# a separate root-owned location; the CGI/worker payload is never executed root.
+install -d -m 755 /usr/local/libexec/synoharbor
+install -o root -g root -m 755 /var/packages/synoharbor/target/bin/synoharbor /usr/local/libexec/synoharbor/synoharbor
+mkdir -p /usr/local/lib/systemd/system/pkgctl-synoharbor.service.d
+cat >/usr/local/lib/systemd/system/synoharbor-broker.service <<'UNIT'
+[Unit]
+Description=SynoHarbor restricted nginx broker
+PartOf=pkgctl-synoharbor.service
+ConditionPathExists=/var/packages/synoharbor/INFO
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/synoharbor/synoharbor broker
+User=root
+Group=root
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+UNIT
+cat >/usr/local/lib/systemd/system/pkgctl-synoharbor.service.d/synoharbor-broker.conf <<'UNIT'
+[Unit]
+Wants=synoharbor-broker.service
+After=synoharbor-broker.service
+UNIT
+# Restore package-only lifecycle privileges; no root execution from mutable SPK
+# paths is needed. systemd starts/stops the immutable broker with this package.
+cat >/var/packages/synoharbor/conf/privilege <<'JSON'
+{"defaults":{"run-as":"package"},"username":"sc-synoharbor","groupname":"sc-synoharbor"}
+JSON
+chmod 644 /usr/local/lib/systemd/system/synoharbor-broker.service /usr/local/lib/systemd/system/pkgctl-synoharbor.service.d/synoharbor-broker.conf /var/packages/synoharbor/conf/privilege
+chown root:root /usr/local/lib/systemd/system/synoharbor-broker.service /usr/local/lib/systemd/system/pkgctl-synoharbor.service.d/synoharbor-broker.conf /var/packages/synoharbor/conf/privilege
+systemctl daemon-reload
+systemctl restart synoharbor-broker.service
+printf '%s\n' 'Immutable SynoHarbor broker activated. CGI and worker remain package-user processes.'

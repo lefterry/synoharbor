@@ -20,6 +20,7 @@ type Meta struct {
 type CertificateProfile struct {
 	Meta
 	Domain             string    `json:"domain"`
+	Issuer             string    `json:"issuer"`
 	Email              string    `json:"email"`
 	CredentialID       string    `json:"credentialId"`
 	KeyType            string    `json:"keyType"`

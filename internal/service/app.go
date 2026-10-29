@@ -37,7 +37,12 @@ type App struct {
 
 func New(s *store.Store) *App {
 	a := &App{Store: s, renewing: map[string]bool{}, NewDSM: dsm.New}
-	a.ACME = acme.New(filepath.Join(s.Dir, "acme"), func(id string) { _, _ = s.Enqueue("certificate.deploy", id, nil) })
+	a.ACME = acme.New(filepath.Join(s.Dir, "acme"), func(id string) {
+		var p model.CertificateProfile
+		if s.Get("certificates", id, &p) == nil && p.Status != "issuing" && p.Status != "replacing" && p.Status != "linking" {
+			_, _ = s.Enqueue("certificate.deploy", id, nil)
+		}
+	})
 	a.ACME.Allowed = func(id string) bool {
 		var p model.CertificateProfile
 		return s.Get("certificates", id, &p) == nil && p.Managed && !p.ExternalDeleted
@@ -177,10 +182,36 @@ func (a *App) reconcile(ctx context.Context, snap model.DSMSnapshot) error {
 				return e
 			}
 			a.ACME.Stop(p.ID)
+		} else if p.Fingerprint != "" && p.Managed {
+			var material map[string]string
+			if err := a.Broker.Call(ctx, broker.Request{Action: "native-certificate-info", ID: p.NativeID}, &material); err != nil {
+				return err
+			}
+			fingerprint, leaf, err := dsm.Fingerprint([]byte(material["certificate"]))
+			if err != nil {
+				return err
+			}
+			if fingerprint != p.Fingerprint && fingerprint != p.PendingFingerprint {
+				p.Fingerprint = fingerprint
+				p.ExpiresAt = leaf.NotAfter
+				p.Issuer = leaf.Issuer.CommonName
+				p.AutoRenew = false
+				p.Managed = false
+				p.PendingFingerprint = ""
+				p.Status = "changed_in_dsm"
+				p.Message = "Native certificate replacement adopted; review this profile before resuming ACME management"
+				if len(leaf.DNSNames) == 1 && model.ValidDomain(leaf.DNSNames[0], true) {
+					p.Domain = leaf.DNSNames[0]
+				}
+				if err = a.Store.Put("certificates", &p.Meta, &p); err != nil {
+					return err
+				}
+				a.ACME.Stop(p.ID)
+			}
 		}
 	}
 	for _, p := range hosts {
-		if p.NativeID == "" || p.ExternalDeleted || !p.Enabled {
+		if p.NativeID == "" || p.ExternalDeleted || !p.Enabled || p.Status == "applying" || p.Status == "queued" {
 			continue
 		}
 		o, ok := proxies[p.NativeID]
@@ -358,8 +389,12 @@ func (a *App) Certificate(ctx context.Context, id string, renew, deployOnly bool
 	if e != nil {
 		return e
 	}
+	if deployOnly && p.NativeID != "" && p.Fingerprint == fingerprint && p.PendingFingerprint == "" {
+		return nil
+	}
 	p.PendingFingerprint = fingerprint
 	p.ExpiresAt = leaf.NotAfter
+	p.Issuer = leaf.Issuer.CommonName
 	p.Status = "deployment_pending"
 	p.Message = "Certificate stored; DSM deployment pending"
 	if e = a.Store.Put("certificates", &p.Meta, &p); e != nil {
@@ -426,6 +461,9 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 	if e := a.Store.Get("certificates", p.CertificateID, &cert); e != nil {
 		return errors.New("select a managed certificate")
 	}
+	if cert.Staging {
+		return errors.New("staging certificates cannot be used by a production proxy")
+	}
 	if cert.NativeID == "" || cert.ExternalDeleted || cert.PendingFingerprint != "" {
 		return errors.New("certificate must be deployed first")
 	}
@@ -450,6 +488,9 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 		return e
 	}
 	if e := a.applyRulesFor(ctx, &p); e != nil {
+		p.Status = "error"
+		p.Message = e.Error()
+		_ = a.Store.Put("proxies", &p.Meta, &p)
 		return e
 	}
 	e := a.withDSM(ctx, false, "", func(c *dsm.Client) error {
@@ -501,7 +542,9 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 		return nil
 	})
 	if e == nil && p.Enabled {
-		e = VerifyHTTPS(ctx, p, cert.Fingerprint)
+		// DSM may return before nginx has completed its native certificate reload.
+		// Keep this operation applying while fresh connections observe the binding.
+		e = WaitHTTPS(ctx, p, cert.Fingerprint, time.Minute)
 		if e == nil {
 			p.HTTPSVerified = true
 			p.Status = "ready"
@@ -519,6 +562,26 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 		return e
 	}
 	return a.applyRulesFor(ctx, &p)
+}
+func WaitHTTPS(ctx context.Context, p model.ProxyHost, fingerprint string, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	var last error
+	for {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		last = VerifyHTTPS(probeCtx, p, fingerprint)
+		cancel()
+		if last == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return last
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 func VerifyHTTPS(ctx context.Context, p model.ProxyHost, fingerprint string) error {
 	roots, e := x509.SystemCertPool()
@@ -575,6 +638,7 @@ func (a *App) AdoptCertificate(ctx context.Context, p model.CertificateProfile) 
 	p.AutoRenew = true
 	p.Fingerprint = fingerprint
 	p.ExpiresAt = leaf.NotAfter
+	p.Issuer = leaf.Issuer.CommonName
 	p.Status = "ready"
 	p.Message = "Adopted from DSM without reissuance"
 	if e = a.Store.Put("certificates", &p.Meta, &p); e != nil {
@@ -737,6 +801,8 @@ func (a *App) execute(ctx context.Context, op model.Operation) {
 		e = a.Certificate(ctx, op.ObjectID, false, false)
 	case "certificate.renew":
 		e = a.Certificate(ctx, op.ObjectID, true, false)
+	case "certificate.replace":
+		e = a.ReplaceCertificate(ctx, op.ObjectID)
 	case "certificate.deploy":
 		e = a.Certificate(ctx, op.ObjectID, false, true)
 	case "proxy.apply":
@@ -793,4 +859,24 @@ func sha256Sum(b []byte) []byte { sum := sha256.Sum256(b); return sum[:] }
 
 func (a *App) SetHTTP2(ctx context.Context, enabled bool) error {
 	return a.withDSM(ctx, false, "", func(c *dsm.Client) error { return c.SetHTTP2(ctx, enabled) })
+}
+
+func (a *App) DeleteCredential(id string) error {
+	var profiles []model.CertificateProfile
+	if e := a.Store.List("certificates", &profiles); e != nil {
+		return e
+	}
+	for _, p := range profiles {
+		if p.CredentialID == id && !p.ExternalDeleted {
+			return errors.New("credential is used by a certificate; select a replacement first")
+		}
+	}
+	var c model.Credential
+	if e := a.Store.Get("credentials", id, &c); e != nil {
+		return e
+	}
+	if e := a.Store.Delete("credentials", id, c.Version); e != nil {
+		return e
+	}
+	return a.Store.DeleteSecret("cloudflare:" + id)
 }

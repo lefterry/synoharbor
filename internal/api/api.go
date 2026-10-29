@@ -126,7 +126,8 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			}
 			_ = s.Get("snapshot", "main", &snapshot)
 			ops, e := s.Operations()
-			return map[string]any{"certificates": certs, "proxies": proxies, "accessLists": lists, "credentials": credentials, "snapshot": snapshot, "operations": ops, "settings": a.App.Settings()}, e
+			brokerReady := a.App.Broker.Call(ctx, broker.Request{Action: "status"}, nil) == nil
+			return map[string]any{"brokerReady": brokerReady, "certificates": certs, "proxies": proxies, "accessLists": lists, "credentials": credentials, "snapshot": snapshot, "operations": ops, "settings": a.App.Settings()}, e
 		case "operations":
 			if id != "" {
 				return s.Operation(id)
@@ -177,8 +178,6 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 				return nil, errors.New("enter the current six-digit OTP")
 			}
 			return a.App.Settings(), a.App.Connect(ctx, req.Account, req.Password, req.OTP, req.Port)
-		case "legacy-import":
-			return a.legacyImport(ctx)
 		case "http2":
 			var req struct {
 				Enabled bool `json:"enabled"`
@@ -218,23 +217,52 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			}
 			return req.Credential, s.Put("credentials", &req.Meta, &req.Credential)
 		case "certificates":
+			if action == "replace" {
+				return s.Enqueue("certificate.replace", id, nil)
+			}
 			if action == "renew" || action == "deploy" {
 				return s.Enqueue("certificate."+action, id, nil)
 			}
 			var req struct {
-				Profile model.CertificateProfile `json:"profile"`
-				Proxy   *model.ProxyHost         `json:"proxy,omitempty"`
-				Adopt   bool                     `json:"adopt"`
+				Profile json.RawMessage  `json:"profile"`
+				Proxy   *model.ProxyHost `json:"proxy,omitempty"`
+				Adopt   bool             `json:"adopt"`
 			}
 			if e := decode(r, &req); e != nil {
 				return nil, e
 			}
-			p := req.Profile
+			var editable certificateInput
+			if json.Unmarshal(req.Profile, &editable) != nil {
+				return nil, errors.New("invalid certificate fields")
+			}
+			p := editable.profile()
+			if !req.Adopt {
+				p.NativeID = ""
+			}
+			var credential model.Credential
+			if s.Get("credentials", p.CredentialID, &credential) != nil {
+				return nil, errors.New("select an available Cloudflare credential")
+			}
 			if e := p.Validate(); e != nil {
 				return nil, e
 			}
+			var existing []model.CertificateProfile
+			if e := s.List("certificates", &existing); e != nil {
+				return nil, e
+			}
+			for _, v := range existing {
+				if v.ID != p.ID && v.Domain == p.Domain && v.Staging == p.Staging && !v.ExternalDeleted && v.Managed {
+					return nil, errors.New("a certificate profile already exists for this domain; edit that profile")
+				}
+			}
+			if p.Staging && req.Proxy != nil {
+				return nil, errors.New("staging certificates are for issuance tests; use a production profile for a proxy")
+			}
 			var old model.CertificateProfile
 			if p.ID != "" && s.Get("certificates", p.ID, &old) == nil {
+				if old.NativeID != "" && p.Staging != old.Staging {
+					return nil, errors.New("create a separate staging profile; an existing deployed certificate cannot change CA mode")
+				}
 				if p.Domain != old.Domain {
 					return nil, errors.New("create a separate profile for another domain")
 				}
@@ -243,7 +271,8 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 				p.PendingFingerprint = old.PendingFingerprint
 				p.LastDeployed = old.LastDeployed
 				p.ExpiresAt = old.ExpiresAt
-				p.Status = old.Status
+				p.Status = "queued"
+				p.Issuer = old.Issuer
 				p.ExternalDeleted = old.ExternalDeleted
 				if p.ExternalDeleted {
 					return nil, errors.New("certificate was removed from DSM")
@@ -254,9 +283,13 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 				if e := a.App.AdoptCertificate(ctx, p); e != nil {
 					return nil, e
 				}
+				if req.Proxy != nil {
+					h := *req.Proxy
+					h.CertificateID = p.ID
+					return a.saveProxy(h, true)
+				}
 				return map[string]string{"status": "adopted"}, nil
 			}
-			p.AutoRenew = true
 			if p.Status == "" {
 				p.Status = "queued"
 			}
@@ -362,21 +395,7 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			}
 			return nil, s.Delete("access", id, list.Version)
 		case "credentials":
-			var profiles []model.CertificateProfile
-			_ = s.List("certificates", &profiles)
-			for _, p := range profiles {
-				if p.CredentialID == id {
-					return nil, errors.New("credential is used by a certificate")
-				}
-			}
-			var c model.Credential
-			if e := s.Get("credentials", id, &c); e != nil {
-				return nil, e
-			}
-			if e := s.Delete("credentials", id, c.Version); e != nil {
-				return nil, e
-			}
-			return nil, s.DeleteSecret("cloudflare:" + id)
+			return nil, a.App.DeleteCredential(id)
 		}
 	}
 	return nil, errors.New("unsupported endpoint or method")
@@ -432,51 +451,22 @@ func (a *API) saveProxy(p model.ProxyHost, enqueue bool) (any, error) {
 	}
 	return p, nil
 }
-func (a *API) legacyImport(ctx context.Context) (any, error) {
-	var legacy struct {
-		Domains  []string `json:"domains"`
-		Email    string   `json:"email"`
-		KeyType  string   `json:"keyType"`
-		Token    string   `json:"token"`
-		Account  string   `json:"account"`
-		Password string   `json:"password"`
-		Port     int      `json:"port"`
-	}
-	if e := a.App.Broker.Call(ctx, broker.Request{Action: "legacy-export"}, &legacy); e != nil {
-		return nil, e
-	}
-	s := a.App.Store
-	var credentials []model.Credential
-	_ = s.List("credentials", &credentials)
-	var credential model.Credential
-	for _, c := range credentials {
-		if c.Name == "Imported from DNSACME" {
-			credential = c
-		}
-	}
-	credential.Name = "Imported from DNSACME"
-	credential.Configured = true
-	if credential.ID == "" {
-		credential.ID = uuid.NewString()
-	}
-	if e := s.PutSecret("cloudflare:"+credential.ID, legacy.Token); e != nil {
-		return nil, e
-	}
-	if e := s.Put("credentials", &credential.Meta, &credential); e != nil {
-		return nil, e
-	}
-	settings := a.App.Settings()
-	if !settings.Connected {
-		settings.Account = legacy.Account
-		settings.Port = legacy.Port
-		settings.AuthStatus = "reauth_required"
-		settings.AuthMessage = "Sign in once to create a separate SynoHarbor trusted device"
-		if e := s.PutSecret("dsm", model.ConnectionSecret{Password: legacy.Password}); e != nil {
-			return nil, e
-		}
-		if e := s.Put("settings", &settings.Meta, &settings); e != nil {
-			return nil, e
-		}
-	}
-	return map[string]any{"credential": credential, "domains": legacy.Domains, "email": legacy.Email, "keyType": legacy.KeyType, "connection": "Credentials imported privately; complete DSM sign-in with a fresh OTP"}, nil
+
+// Server-owned timestamps and operation state are intentionally excluded. Old
+// clients may send those fields; json.Unmarshal ignores them, so empty date
+// strings cannot break a new-certificate request or overwrite runtime state.
+type certificateInput struct {
+	ID           string `json:"id"`
+	Version      int    `json:"version"`
+	Domain       string `json:"domain"`
+	Email        string `json:"email"`
+	CredentialID string `json:"credentialId"`
+	KeyType      string `json:"keyType"`
+	Staging      bool   `json:"staging"`
+	AutoRenew    bool   `json:"autoRenew"`
+	NativeID     string `json:"nativeId"`
+}
+
+func (p certificateInput) profile() model.CertificateProfile {
+	return model.CertificateProfile{Meta: model.Meta{ID: p.ID, Version: p.Version}, Domain: p.Domain, Email: p.Email, CredentialID: p.CredentialID, KeyType: p.KeyType, Staging: p.Staging, AutoRenew: p.AutoRenew, NativeID: p.NativeID}
 }

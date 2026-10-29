@@ -40,8 +40,17 @@ Builds `synoharbor-amd64.spk` and `synoharbor-arm64.spk`. Initial live validatio
 targets AMD64 only. Install through DSM Package Center, then open SynoHarbor from
 the DSM desktop using an administrator session.
 
-Start in Settings: import existing DNSACME settings or add a Cloudflare credential,
-then connect the DSM administrator account and register a SynoHarbor trusted
+DSM 7.3 unsigned packages need a one-time administrator activation after each
+install/upgrade. Run this as root via SSH or DSM Task Scheduler:
+
+```sh
+/var/packages/synoharbor/scripts/activate
+```
+
+The CGI and worker remain unprivileged. Only the restricted broker runs as root.
+Settings shows whether activation is complete.
+
+Start in Settings: add a Cloudflare credential, then connect the DSM administrator account and register a SynoHarbor trusted
 device with a current OTP. Passwords, tokens and keys remain on the NAS.
 
 Stopping the package leaves the last valid nginx configuration serving traffic.
