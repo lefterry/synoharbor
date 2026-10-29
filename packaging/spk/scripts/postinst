@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+# Root-started broker code and launch scripts must not be replaceable by the
+# unprivileged package account. Writable state lives exclusively in FHS var/.
+chown -R root:root /var/packages/synoharbor/target /var/packages/synoharbor/scripts
+chmod 755 /var/packages/synoharbor/target /var/packages/synoharbor/target/bin
+mkdir -p /var/packages/synoharbor/var
+chown sc-synoharbor:sc-synoharbor /var/packages/synoharbor/var
+chmod 700 /var/packages/synoharbor/var

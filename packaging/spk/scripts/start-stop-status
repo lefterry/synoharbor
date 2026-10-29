@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+umask 077
+TARGET=/var/packages/synoharbor/target
+VAR=/var/packages/synoharbor/var
+BIN=$TARGET/bin/synoharbor
+alive() {
+ [ -f "$VAR/$1.pid" ] || return 1
+ pid=$(cat "$VAR/$1.pid")
+ case "$pid" in ''|*[!0-9]*) return 1;; esac
+ kill -0 "$pid" 2>/dev/null || return 1
+ [ "$(readlink -f "/proc/$pid/exe")" = "$(readlink -f "$BIN")" ] || return 1
+ tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q " $1" || return 1
+ printf '%s\n' "$pid"
+}
+case "${1:-}" in
+ start)
+  [ "$(id -u)" = 0 ] || exit 1
+  mkdir -p "$VAR"
+  chown sc-synoharbor:sc-synoharbor "$VAR"
+  chmod 700 "$VAR"
+  if ! alive broker >/dev/null; then
+   "$BIN" broker >>"$VAR/broker.log" 2>&1 &
+   echo "$!" > "$VAR/broker.pid"
+  fi
+  if ! alive worker >/dev/null; then
+   su -s /bin/sh sc-synoharbor -c 'umask 077; nohup /var/packages/synoharbor/target/bin/synoharbor worker >>/var/packages/synoharbor/var/worker.log 2>&1 & echo $! >/var/packages/synoharbor/var/worker.pid'
+  fi
+  ;;
+ stop)
+  for role in worker broker; do
+   pid=$(alive "$role" 2>/dev/null) || pid=""
+   if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+   rm -f "$VAR/$role.pid"
+  done
+  # The native nginx keeps serving the last valid configuration when management
+  # stops. Certificate renewal requires the worker to be running.
+  ;;
+ status) alive worker >/dev/null && alive broker >/dev/null;;
+ log) printf '%s\n' "$VAR/worker.log";;
+ *) exit 1;;
+esac

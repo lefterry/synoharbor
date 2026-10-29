@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+umask 077
+VAR=/var/packages/synoharbor/var
+if [ -d "$VAR" ]; then
+ backup_dir="$(dirname "$(readlink -f "$VAR")")/synoharbor-backups"
+ mkdir -p "$backup_dir"
+ chmod 700 "$backup_dir"
+ tar -czf "$backup_dir/upgrade-$(date +%Y%m%dT%H%M%S).tgz" -C "$VAR" .
+fi

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Deliberately preserve data and native routes. Uninstall stops renewal; the DSM
+# proxies and their last valid access rules remain available for recovery.
+exit 0

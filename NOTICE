@@ -1,0 +1,10 @@
+SynoHarbor
+Copyright 2026 SynoHarbor contributors
+
+Selected DSM authentication, certificate import and ACME integration patterns
+are adapted from DNSACME (https://github.com/mritd/dnsacme), copyright its
+contributors, licensed under Apache License 2.0. Adapted files are marked.
+This is an independent project, not affiliated with Synology or DNSACME.
+
+Nginx Proxy Manager informed the feature requirements. No NPM source or branding
+is included. Synology runtime assets are not distributed in this repository.

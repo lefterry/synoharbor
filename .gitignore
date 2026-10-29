@@ -1,0 +1,8 @@
+/build/
+/web/node_modules/
+/web/dist/
+*.sqlite*
+*.pem
+*.key
+.DS_Store
+/data/

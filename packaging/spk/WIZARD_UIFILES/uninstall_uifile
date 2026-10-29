@@ -1,0 +1,1 @@
+[{"step_title":"Uninstall SynoHarbor","items":[{"type":"description","desc":"Certificate renewal will stop. Native DSM proxies, certificates, last valid Advanced rules and private package data are preserved. Remove services through SynoHarbor before uninstalling if you want them deleted."}]}]
