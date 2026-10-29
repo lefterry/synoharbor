@@ -97,6 +97,28 @@ func (a *App) ReplaceCertificate(ctx context.Context, id string) error {
 		return e
 	}
 	if e = a.withDSM(ctx, false, "", func(c *dsm.Client) error {
+		snap, e := c.Snapshot(ctx)
+		if e != nil {
+			return e
+		}
+		if nativeObject(snap.Certificates, record.Old.NativeID) != nil {
+			if e = a.rememberCertificate(ctx, snap, record.Old.NativeID); e != nil {
+				return e
+			}
+			if e = a.rememberBindings(snap, record.Old.NativeID, fresh.NativeID); e != nil {
+				return e
+			}
+		}
+		if record.WasDefault {
+			state := a.recoveryState()
+			if state.DefaultBefore == "" {
+				state.DefaultBefore = record.Old.NativeID
+			}
+			state.DefaultAfter = fresh.NativeID
+			if e = a.Store.Put("recovery", &state.Meta, &state); e != nil {
+				return e
+			}
+		}
 		return c.ReplaceBindings(ctx, record.Old.NativeID, fresh.NativeID, record.WasDefault)
 	}); e != nil {
 		return e

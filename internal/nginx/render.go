@@ -82,7 +82,7 @@ func Render(in Input) (Bundle, error) {
 		}
 	}
 	if cache {
-		c.WriteString("map $uri $synoharbor_skip_asset { default 1; ~*\\.(?:css|js|png|jpg|jpeg|gif|webp|ico|svg|woff|woff2|ttf)$ 0; }\nproxy_cache_path /usr/local/var/cache/synoharbor levels=1:2 keys_zone=synoharbor_assets:10m max_size=512m inactive=24h use_temp_path=off;\n")
+		c.WriteString("map $uri $synoharbor_skip_asset { default 1; ~*\\.(?:css|js|png|jpg|jpeg|gif|webp|ico|svg|woff|woff2|ttf)$ 0; }\nproxy_cache_path /usr/local/etc/synoharbor/cache levels=1:2 keys_zone=synoharbor_assets:10m max_size=512m inactive=24h use_temp_path=off;\n")
 	}
 	for _, p := range in.Hosts {
 		if !p.Enabled || !p.Managed || p.ExternalDeleted || p.AdvancedBypassed {
@@ -146,90 +146,121 @@ func Render(in Input) (Bundle, error) {
 				fmt.Fprintf(&c, " auth_basic \"SynoHarbor\";\n auth_basic_user_file %s/%s.htpasswd;\n", Root, a.ID)
 			}
 		}
-		locs := []model.Location{{Path: "/", Target: p.Target, Snippet: p.Advanced.Snippet}}
-		locs = append(locs, p.Advanced.Locations...)
-		seen := map[string]bool{}
-		for i, l := range locs {
-			if seen[l.Path] {
-				return b, errors.New("duplicate custom location")
+		if p.AppUI {
+			c.WriteString(" add_header X-Frame-Options SAMEORIGIN always;\n add_header Referrer-Policy no-referrer always;\n add_header Content-Security-Policy \"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'\" always;\n")
+			// Only this package's fixed paths are forwarded. Raw DSM APIs, login
+			// pages, arbitrary files and other packages are not exposed here.
+			paths := [][2]string{{"/", "index.html"}, {"/index.html", "index.html"}, {"/app.js", "app.js"}, {"/app.css", "app.css"}, {"/logo.svg", "logo.svg"}, {"/api.cgi", "api.cgi"}, {"/signin.cgi", "signin.cgi"}}
+			for _, path := range paths {
+				fmt.Fprintf(&c, " location = %s {\n  proxy_pass https://127.0.0.1:%d/webman/3rdparty/synoharbor/%s;\n  proxy_http_version 1.1;\n  proxy_set_header Host 127.0.0.1;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $remote_addr;\n  proxy_set_header X-Forwarded-Proto https;\n  proxy_set_header Connection \"\";\n  proxy_set_header Upgrade \"\";\n  proxy_set_header Authorization \"\";\n  proxy_ssl_verify off;\n  proxy_ssl_session_reuse off;\n  proxy_cache off;\n  proxy_redirect off;\n  proxy_read_timeout 90s;\n }\n", path[0], p.Target.Port, path[1])
 			}
-			seen[l.Path] = true
-			fmt.Fprintf(&c, " location %s {\n", l.Path)
-			a := p.Advanced
-			fmt.Fprintf(&c, "  proxy_connect_timeout %ds;\n  proxy_read_timeout %ds;\n  proxy_send_timeout %ds;\n  proxy_http_version 1.1;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $remote_addr;\n  proxy_set_header X-Forwarded-Proto https;\n", or(a.ConnectTimeout, 60), or(a.ReadTimeout, 60), or(a.SendTimeout, 60))
-			if a.WebSockets {
-				c.WriteString("  proxy_set_header Upgrade $http_upgrade;\n  proxy_set_header Connection $connection_upgrade;\n")
-			} else {
-				c.WriteString("  proxy_set_header Connection \"\";\n")
-			}
-			if acl, ok := in.Access[p.AccessListID]; ok && len(acl.Users) > 0 && !acl.PassAuthorization {
-				c.WriteString("  proxy_set_header Authorization \"\";\n")
-			}
-			if a.CacheAssets {
-				c.WriteString("  proxy_cache synoharbor_assets;\n  proxy_cache_methods GET HEAD;\n  proxy_cache_key \"$scheme$host$request_uri\";\n  proxy_cache_bypass $synoharbor_skip_asset $http_authorization $http_cookie $http_upgrade;\n  proxy_no_cache $synoharbor_skip_asset $http_authorization $http_cookie $http_upgrade;\n  proxy_cache_valid 200 10m;\n")
-			}
-			for _, h := range a.Headers {
-				if !headerName.MatchString(h.Name) {
-					return b, errors.New("invalid custom header name")
+			c.WriteString(" location / { return 404; }\n")
+		} else {
+			locs := []model.Location{{Path: "/", Target: p.Target, Snippet: p.Advanced.Snippet}}
+			locs = append(locs, p.Advanced.Locations...)
+			seen := map[string]bool{}
+			for i, l := range locs {
+				if seen[l.Path] {
+					return b, errors.New("duplicate custom location")
 				}
-				lower := strings.ToLower(h.Name)
-				if lower == "x-real-ip" || lower == "x-forwarded-for" || lower == "x-forwarded-proto" || lower == "authorization" || lower == "connection" || lower == "upgrade" || lower == "strict-transport-security" || lower == "host" {
-					return b, errors.New("use the dedicated option for this reserved header")
+				seen[l.Path] = true
+				fmt.Fprintf(&c, " location %s {\n", l.Path)
+				a := p.Advanced
+				fmt.Fprintf(&c, "  proxy_connect_timeout %ds;\n  proxy_read_timeout %ds;\n  proxy_send_timeout %ds;\n  proxy_http_version 1.1;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $remote_addr;\n  proxy_set_header X-Forwarded-Proto https;\n", or(a.ConnectTimeout, 60), or(a.ReadTimeout, 60), or(a.SendTimeout, 60))
+				if a.WebSockets {
+					c.WriteString("  proxy_set_header Upgrade $http_upgrade;\n  proxy_set_header Connection $connection_upgrade;\n")
+				} else {
+					c.WriteString("  proxy_set_header Connection \"\";\n")
 				}
-				v, e := quoted(h.Value)
+				if acl, ok := in.Access[p.AccessListID]; ok && len(acl.Users) > 0 && !acl.PassAuthorization {
+					c.WriteString("  proxy_set_header Authorization \"\";\n")
+				}
+				if a.CacheAssets {
+					// DSM globally disables buffering. nginx cannot cache proxy
+					// responses without explicitly enabling it in this location.
+					snippet, e := Snippet(l.Snippet)
+					if e != nil {
+						return b, e
+					}
+					buffering := regexp.MustCompile(`(?m)^\s*proxy_buffering\s+([^;]+);`).FindStringSubmatch(snippet)
+					if len(buffering) > 0 && buffering[1] != "on" && buffering[1] != "off" {
+						return b, errors.New("proxy_buffering must be on or off")
+					}
+					if len(buffering) == 0 {
+						c.WriteString("  proxy_buffering on;\n")
+					}
+					if len(buffering) > 0 && buffering[1] == "off" {
+						c.WriteString("  proxy_cache off;\n")
+					} else {
+						c.WriteString("  proxy_cache synoharbor_assets;\n  proxy_cache_methods GET HEAD;\n  proxy_cache_key \"$scheme$host$proxy_host$request_uri\";\n  proxy_cache_bypass $synoharbor_skip_asset $http_authorization $http_cookie $http_upgrade;\n  proxy_no_cache $synoharbor_skip_asset $http_authorization $http_cookie $http_upgrade;\n  proxy_cache_valid 200 10m;\n")
+					}
+				}
+				for _, h := range a.Headers {
+					if !headerName.MatchString(h.Name) {
+						return b, errors.New("invalid custom header name")
+					}
+					lower := strings.ToLower(h.Name)
+					if lower == "x-real-ip" || lower == "x-forwarded-for" || lower == "x-forwarded-proto" || lower == "authorization" || lower == "connection" || lower == "upgrade" || lower == "strict-transport-security" || lower == "host" {
+						return b, errors.New("use the dedicated option for this reserved header")
+					}
+					v, e := quoted(h.Value)
+					if e != nil {
+						return b, e
+					}
+					if strings.Contains(h.Value, "$") {
+						return b, errors.New("custom headers must contain literal values")
+					}
+					directive := "proxy_set_header"
+					tail := ""
+					if h.Response {
+						directive = "add_header"
+						tail = " always"
+					}
+					fmt.Fprintf(&c, "  %s %s %s%s;\n", directive, h.Name, v, tail)
+				}
+				if l.Target.Scheme == "https" {
+					// Implicit upstreams share a session cache by address, not SNI or
+					// trust policy. Two routes to the NAS HTTPS port can use
+					// different names; never resume another route's session.
+					c.WriteString("  proxy_ssl_server_name on;\n  proxy_ssl_session_reuse off;\n")
+					name := l.Target.TLS.ServerName
+					if name == "" {
+						name = l.Target.Host
+					}
+					fmt.Fprintf(&c, "  proxy_ssl_name %s;\n", name)
+					if l.Target.TLS.Verify {
+						trust := "/etc/ssl/certs/ca-certificates.crt"
+						if l.Target.TLS.TrustedPEM != "" {
+							raw, rest := pem.Decode([]byte(l.Target.TLS.TrustedPEM))
+							if raw == nil || raw.Type != "CERTIFICATE" || len(strings.TrimSpace(string(rest))) != 0 {
+								return b, errors.New("provide one trusted PEM certificate")
+							}
+							if _, e := x509.ParseCertificate(raw.Bytes); e != nil {
+								return b, errors.New("invalid trusted certificate")
+							}
+							file := fmt.Sprintf("%s-%d.trust.pem", p.ID, i)
+							b.Files[file] = []byte(l.Target.TLS.TrustedPEM)
+							trust = Root + "/" + file
+						}
+						fmt.Fprintf(&c, "  proxy_ssl_verify on;\n  proxy_ssl_verify_depth 5;\n  proxy_ssl_trusted_certificate %s;\n", trust)
+					} else {
+						c.WriteString("  proxy_ssl_verify off;\n")
+					}
+				}
+				snippet, e := Snippet(l.Snippet)
 				if e != nil {
 					return b, e
 				}
-				if strings.Contains(h.Value, "$") {
-					return b, errors.New("custom headers must contain literal values")
-				}
-				directive := "proxy_set_header"
-				tail := ""
-				if h.Response {
-					directive = "add_header"
-					tail = " always"
-				}
-				fmt.Fprintf(&c, "  %s %s %s%s;\n", directive, h.Name, v, tail)
-			}
-			if l.Target.Scheme == "https" {
-				c.WriteString("  proxy_ssl_server_name on;\n")
-				name := l.Target.TLS.ServerName
-				if name == "" {
-					name = l.Target.Host
-				}
-				fmt.Fprintf(&c, "  proxy_ssl_name %s;\n", name)
-				if l.Target.TLS.Verify {
-					trust := "/etc/ssl/certs/ca-certificates.crt"
-					if l.Target.TLS.TrustedPEM != "" {
-						raw, rest := pem.Decode([]byte(l.Target.TLS.TrustedPEM))
-						if raw == nil || raw.Type != "CERTIFICATE" || len(strings.TrimSpace(string(rest))) != 0 {
-							return b, errors.New("provide one trusted PEM certificate")
-						}
-						if _, e := x509.ParseCertificate(raw.Bytes); e != nil {
-							return b, errors.New("invalid trusted certificate")
-						}
-						file := fmt.Sprintf("%s-%d.trust.pem", p.ID, i)
-						b.Files[file] = []byte(l.Target.TLS.TrustedPEM)
-						trust = Root + "/" + file
+				c.WriteString(snippet)
+				if p.Advanced.HSTS {
+					suffix := ""
+					if p.Advanced.IncludeSubdomains {
+						suffix = "; includeSubDomains"
 					}
-					fmt.Fprintf(&c, "  proxy_ssl_verify on;\n  proxy_ssl_verify_depth 5;\n  proxy_ssl_trusted_certificate %s;\n", trust)
-				} else {
-					c.WriteString("  proxy_ssl_verify off;\n")
+					fmt.Fprintf(&c, "  add_header Strict-Transport-Security \"max-age=15552000%s\" always;\n", suffix)
 				}
+				fmt.Fprintf(&c, "  proxy_pass %s://%s;\n }\n", l.Target.Scheme, net.JoinHostPort(l.Target.Host, strconv.Itoa(l.Target.Port)))
 			}
-			snippet, e := Snippet(l.Snippet)
-			if e != nil {
-				return b, e
-			}
-			c.WriteString(snippet)
-			if p.Advanced.HSTS {
-				suffix := ""
-				if p.Advanced.IncludeSubdomains {
-					suffix = "; includeSubDomains"
-				}
-				fmt.Fprintf(&c, "  add_header Strict-Transport-Security \"max-age=15552000%s\" always;\n", suffix)
-			}
-			fmt.Fprintf(&c, "  proxy_pass %s://%s;\n }\n", l.Target.Scheme, net.JoinHostPort(l.Target.Host, strconv.Itoa(l.Target.Port)))
 		}
 		c.WriteString("}\n")
 		if p.Advanced.ForceSSL && p.HTTPSVerified {

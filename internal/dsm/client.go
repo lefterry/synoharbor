@@ -36,11 +36,12 @@ func TerminalAuth(err error) bool {
 }
 
 type Client struct {
-	BaseURL    string
-	HTTP       *http.Client
-	sid, token string
-	Account    string
-	Secret     model.ConnectionSecret
+	BrowserOnly bool
+	BaseURL     string
+	HTTP        *http.Client
+	sid, token  string
+	Account     string
+	Secret      model.ConnectionSecret
 }
 
 func New(settings model.Settings, secret model.ConnectionSecret) *Client {
@@ -109,9 +110,11 @@ func (c *Client) Login(ctx context.Context, otp string) error {
 	p := map[string]any{"account": c.Account, "passwd": c.Secret.Password, "session": "Core", "format": "sid", "enable_syno_token": "yes"}
 	if otp != "" {
 		p["otp_code"] = otp
-		p["enable_device_token"] = "yes"
-		p["device_name"] = "SynoHarbor"
-	} else if c.Secret.DeviceID != "" {
+		if !c.BrowserOnly {
+			p["enable_device_token"] = "yes"
+			p["device_name"] = "SynoHarbor"
+		}
+	} else if !c.BrowserOnly && c.Secret.DeviceID != "" {
 		p["device_id"] = c.Secret.DeviceID
 		p["device_name"] = c.Secret.DeviceName
 	}
@@ -137,7 +140,7 @@ func (c *Client) Login(ctx context.Context, otp string) error {
 	} else if out.DID != "" {
 		c.Secret.DeviceID = out.DID
 	}
-	if otp != "" {
+	if otp != "" && !c.BrowserOnly {
 		c.Secret.DeviceName = "SynoHarbor"
 		if c.Secret.DeviceID == "" {
 			c.Logout(ctx)
@@ -145,6 +148,18 @@ func (c *Client) Login(ctx context.Context, otp string) error {
 		}
 	}
 	return nil
+}
+
+type SessionProof struct {
+	SID   string `json:"sid"`
+	Token string `json:"token"`
+}
+
+func (c *Client) SessionProof() SessionProof { return SessionProof{SID: c.sid, Token: c.token} }
+func FromSession(settings model.Settings, p SessionProof) *Client {
+	c := New(settings, model.ConnectionSecret{})
+	c.sid, c.token = p.SID, p.Token
+	return c
 }
 func (c *Client) Logout(ctx context.Context) {
 	if c.sid != "" {
@@ -164,6 +179,9 @@ func (c *Client) Snapshot(ctx context.Context) (model.DSMSnapshot, error) {
 	}
 	if e := c.form(ctx, "SYNO.Core.AppPortal.ReverseProxy", "list", nil, &proxies); e != nil {
 		return model.DSMSnapshot{}, e
+	}
+	if certs.Certificates == nil || proxies.Entries == nil {
+		return model.DSMSnapshot{}, errors.New("incomplete DSM inventory; synchronization skipped")
 	}
 	return model.DSMSnapshot{Certificates: certs.Certificates, Proxies: proxies.Entries, SuccessAt: time.Now().UTC()}, nil
 }
@@ -229,6 +247,55 @@ func (c *Client) SaveProxy(ctx context.Context, p model.ProxyHost) (string, erro
 }
 func (c *Client) DeleteProxy(ctx context.Context, id string) error {
 	return c.form(ctx, "SYNO.Core.AppPortal.ReverseProxy", "delete", map[string]any{"uuids": []string{id}}, nil)
+}
+func (c *Client) RestoreProxy(ctx context.Context, entry model.DSMObject) error {
+	return c.form(ctx, "SYNO.Core.AppPortal.ReverseProxy", "update", map[string]any{"entry": entry}, nil)
+}
+func (c *Client) RestoreDefault(ctx context.Context, expected, before string) error {
+	snap, e := c.Snapshot(ctx)
+	if e != nil {
+		return e
+	}
+	var target model.DSMObject
+	for _, cert := range snap.Certificates {
+		if ID(cert) == before {
+			target = cert
+		}
+		isDefault, _ := cert["is_default"].(bool)
+		if isDefault && ID(cert) != before && ID(cert) != expected {
+			return errors.New("default certificate changed outside SynoHarbor; rollback stopped")
+		}
+	}
+	if target == nil {
+		return errors.New("original default certificate unavailable")
+	}
+	return c.form(ctx, "SYNO.Core.Certificate.CRT", "set", map[string]any{"id": before, "desc": String(target, "desc"), "as_default": true}, nil)
+}
+func ServiceKey(s map[string]any) string {
+	return String(s, "subscriber") + "/" + String(s, "service") + "/" + String(s, "owner")
+}
+func (c *Client) RestoreBinding(ctx context.Context, service model.DSMObject, expected, before string) error {
+	snap, e := c.Snapshot(ctx)
+	if e != nil {
+		return e
+	}
+	for _, cert := range snap.Certificates {
+		services, _ := cert["services"].([]any)
+		for _, v := range services {
+			s, _ := v.(map[string]any)
+			if ServiceKey(s) != ServiceKey(service) {
+				continue
+			}
+			if ID(cert) == before {
+				return nil
+			}
+			if ID(cert) != expected {
+				return errors.New("SSL assignment changed outside SynoHarbor; restore stopped")
+			}
+			return c.form(ctx, "SYNO.Core.Certificate.Service", "set", map[string]any{"settings": []any{map[string]any{"service": s, "old_id": expected, "id": before}}}, nil)
+		}
+	}
+	return errors.New("original DSM SSL service is no longer available")
 }
 func (c *Client) DeleteCertificate(ctx context.Context, id string) error {
 	return c.form(ctx, "SYNO.Core.Certificate.CRT", "delete", map[string]any{"ids": []string{id}}, nil)

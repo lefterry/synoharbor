@@ -25,7 +25,7 @@ func TestAllManagementRoutesRequireSessionAdminAndCSRF(t *testing.T) {
 	app := service.New(s)
 	defer app.ACME.Close()
 	a := New(app)
-	for _, route := range []string{"overview", "session", "connection", "certificates", "proxies", "access", "credentials", "http2", "sync", "backup"} {
+	for _, route := range []string{"overview", "session", "connection", "certificates", "proxies", "access", "credentials", "http2", "sync", "backup", "backups", "recovery", "recovery/prepare", "restore-backup", "recovery-status", "standalone", "signout"} {
 		for _, method := range []string{"GET", "POST", "DELETE"} {
 			for _, status := range []int{401, 403} {
 				a.Verify = func(context.Context, auth.Env) (string, string, int, error) {
@@ -41,7 +41,7 @@ func TestAllManagementRoutesRequireSessionAdminAndCSRF(t *testing.T) {
 		}
 	}
 	a.Verify = func(context.Context, auth.Env) (string, string, int, error) { return "admin", "session-one", 200, nil }
-	for _, route := range []string{"overview", "connection", "certificates", "proxies", "access", "credentials", "http2", "sync", "backup"} {
+	for _, route := range []string{"overview", "connection", "certificates", "proxies", "access", "credentials", "http2", "sync", "backup", "backups", "recovery", "recovery/prepare", "restore-backup", "recovery-status", "standalone", "signout"} {
 		r := httptest.NewRequest("POST", "/api.cgi?route="+route, strings.NewReader(`{}`))
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -122,5 +122,63 @@ func TestCertificateWizardEmptyDatesAndCredentialCRUD(t *testing.T) {
 	}
 	if s.Secret("cloudflare:credential-one", &token) == nil {
 		t.Fatal("deleted credential secret survived")
+	}
+}
+
+func TestPublicSignInChecksOriginAndSharesPersistentBudget(t *testing.T) {
+	s, e := store.Open(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	app := service.New(s)
+	defer app.ACME.Close()
+	a := New(app)
+	a.Env = func(k string) string {
+		switch k {
+		case "HTTPS":
+			return "on"
+		case "HTTP_HOST":
+			return "127.0.0.1"
+		case "HTTP_X_REAL_IP":
+			return "192.168.1.7"
+		}
+		return ""
+	}
+	p := model.ProxyHost{Meta: model.Meta{ID: "standalone-test"}, Hostname: "harbor.example.net", AppUI: true, Enabled: true, Managed: true}
+	if e = s.Put("proxies", &p.Meta, &p); e != nil {
+		t.Fatal(e)
+	}
+	// Invalid credentials are rejected before any native network call.
+	invoke := func(origin string) int {
+		r := httptest.NewRequest("POST", "https://harbor.example.net/signin.cgi", strings.NewReader(`{"account":"admin","password":"","otp":""}`))
+		r.Header.Set("Origin", origin)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		a.SignIn(w, r)
+		if strings.Contains(w.Body.String(), "csrfToken") || strings.Contains(w.Body.String(), "credentialId") {
+			t.Fatal("public login exposed management data")
+		}
+		return w.Code
+	}
+	for _, origin := range []string{"", "http://harbor.example.net", "https://evil.example.net", "https://harbor.example.net.evil.net", "https://harbor.example.net/path"} {
+		if code := invoke(origin); code != 403 {
+			t.Fatal("untrusted origin accepted", origin, code)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		if code := invoke("https://harbor.example.net"); code != 401 {
+			t.Fatal("unexpected login response", code)
+		}
+	}
+	if code := invoke("https://harbor.example.net"); code != 429 {
+		t.Fatal("CGI attempts were not rate limited", code)
+	}
+	// A fresh CGI process/API object sees the same budget.
+	fresh := New(app)
+	fresh.Env = a.Env
+	a = fresh
+	if code := invoke("https://harbor.example.net"); code != 429 {
+		t.Fatal("budget reset between requests")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -86,13 +87,10 @@ func (a *App) withDSM(ctx context.Context, interactive bool, otp string, fn func
 		return err
 	}
 	defer c.Logout(context.Background())
-	if err = a.Store.PutSecret("dsm", c.Secret); err != nil {
-		return err
-	}
 	s.Connected = true
 	s.AuthStatus = "ready"
 	s.AuthMessage = "Trusted device ready"
-	if err = a.Store.Put("settings", &s.Meta, &s); err != nil {
+	if err = a.Store.PutSecretObject("settings", &s.Meta, &s, "dsm", c.Secret); err != nil {
 		return err
 	}
 	return fn(c)
@@ -118,10 +116,7 @@ func (a *App) Connect(ctx context.Context, account, password, otp string, port i
 	s.Account, s.Port = account, port
 	s.AuthStatus = "connecting"
 	s.Connected = false
-	if e := a.Store.PutSecret("dsm", secret); e != nil {
-		return e
-	}
-	if e := a.Store.Put("settings", &s.Meta, &s); e != nil {
+	if e := a.Store.PutSecretObject("settings", &s.Meta, &s, "dsm", secret); e != nil {
 		return e
 	}
 	return a.withDSM(ctx, true, otp, func(*dsm.Client) error { return nil })
@@ -145,10 +140,15 @@ func (a *App) Sync(ctx context.Context) error {
 			snap.HTTP2 = enabled
 		}
 
-		if e = a.reconcile(ctx, snap); e != nil {
+		if e = a.Store.Put("snapshot", &snap.Meta, &snap); e != nil {
 			return e
 		}
-		return a.Store.Put("snapshot", &snap.Meta, &snap)
+		err := a.reconcile(ctx, snap)
+		if err != nil {
+			snap.Error = err.Error()
+			_ = a.Store.Put("snapshot", &snap.Meta, &snap)
+		}
+		return err
 	})
 }
 func (a *App) reconcile(ctx context.Context, snap model.DSMSnapshot) error {
@@ -168,12 +168,14 @@ func (a *App) reconcile(ctx context.Context, snap model.DSMSnapshot) error {
 	if e := a.Store.List("proxies", &hosts); e != nil {
 		return e
 	}
-	changedRules := false
 	for _, p := range profiles {
 		if p.NativeID == "" || p.ExternalDeleted {
 			continue
 		}
 		if _, ok := certs[p.NativeID]; !ok {
+			if e := a.markRemoved("certificate", p.NativeID); e != nil {
+				return e
+			}
 			p.ExternalDeleted = true
 			p.AutoRenew = false
 			p.Status = "deleted_in_dsm"
@@ -211,21 +213,56 @@ func (a *App) reconcile(ctx context.Context, snap model.DSMSnapshot) error {
 		}
 	}
 	for _, p := range hosts {
+		if p.ExternalDeleted {
+			message := "Removed in DSM"
+			if len(dependentProxies(snap, p)) > 0 {
+				message = "Native proxy removed; Advanced rules retained for dependent DSM proxies"
+			}
+			if p.Message != message {
+				p.Message = message
+				if e := a.Store.Put("proxies", &p.Meta, &p); e != nil {
+					return e
+				}
+			}
+			continue
+		}
 		if p.NativeID == "" || p.ExternalDeleted || !p.Enabled || p.Status == "applying" || p.Status == "queued" {
 			continue
 		}
 		o, ok := proxies[p.NativeID]
 		if !ok {
+			if e := a.markRemoved("proxy", p.ID); e != nil {
+				return e
+			}
 			p.ExternalDeleted = true
 			p.Enabled = false
 			p.Managed = false
 			p.Status = "deleted_in_dsm"
 			p.Message = "Removed in DSM"
-			changedRules = true
+			if len(dependentProxies(snap, p)) > 0 {
+				p.Message = "Native proxy removed; Advanced rules retained for dependent DSM proxies"
+			}
 			if e := a.Store.Put("proxies", &p.Meta, &p); e != nil {
 				return e
 			}
 			continue
+		}
+		bindingChanged := false
+		actualCertificate := certificateFor(snap, p.NativeID)
+		for _, profile := range profiles {
+			if profile.ID == p.CertificateID && profile.NativeID != actualCertificate && actualCertificate != "" {
+				p.CertificateID = ""
+				for _, candidate := range profiles {
+					if candidate.NativeID == actualCertificate {
+						p.CertificateID = candidate.ID
+					}
+				}
+				p.HTTPSVerified = false
+				p.Status = "changed_in_dsm"
+				p.Message = "Native SSL assignment changed in DSM; adopted without rebinding"
+				bindingChanged = true
+				break
+			}
 		}
 		hash := model.Hash(o)
 		if hash != p.NativeHash {
@@ -243,7 +280,6 @@ func (a *App) reconcile(ctx context.Context, snap model.DSMSnapshot) error {
 				}
 				p.Status = "advanced_bypassed"
 				p.Message = "Target changed in DSM; Advanced rules are detached"
-				changedRules = true
 			} else {
 				p.Status = "changed_in_dsm"
 				p.Message = "Native DSM changes adopted"
@@ -252,12 +288,16 @@ func (a *App) reconcile(ctx context.Context, snap model.DSMSnapshot) error {
 			if e := a.Store.Put("proxies", &p.Meta, &p); e != nil {
 				return e
 			}
+		} else if bindingChanged {
+			if e := a.Store.Put("proxies", &p.Meta, &p); e != nil {
+				return e
+			}
 		}
 	}
-	if changedRules {
-		return a.ApplyRules(ctx)
-	}
-	return nil
+	// Also retry a previously interrupted rules update and retire orphaned
+	// listeners once their final native dependency disappears. The broker skips
+	// unchanged bundles, so ordinary refreshes do not reload nginx.
+	return a.ApplyRules(ctx)
 }
 func (a *App) RenderInput() (nginx.Input, error) {
 	in := nginx.Input{Access: map[string]model.AccessList{}, Passwords: map[string]map[string]string{}}
@@ -265,12 +305,18 @@ func (a *App) RenderInput() (nginx.Input, error) {
 		return in, e
 	}
 	active := []model.ProxyHost{}
+	var snapshot model.DSMSnapshot
+	_ = a.Store.Get("snapshot", "main", &snapshot)
 	for _, p := range in.Hosts {
-		if p.ExternalDeleted || !p.Managed || p.AdvancedBypassed {
+		inactive := p.ExternalDeleted || !p.Managed || p.AdvancedBypassed || !p.Enabled
+		if inactive && len(dependentProxies(snapshot, p)) == 0 {
 			continue
 		}
 		var applied model.ProxyHost
 		if a.Store.Get("applied-proxies", p.ID, &applied) == nil {
+			if inactive {
+				applied.Advanced.ForceSSL = false
+			}
 			active = append(active, applied)
 		}
 	}
@@ -291,11 +337,35 @@ func (a *App) RenderInput() (nginx.Input, error) {
 	}
 	return in, nil
 }
+func dependentProxies(snap model.DSMSnapshot, p model.ProxyHost) []string {
+	ids := []string{}
+	if p.LoopbackPort == 0 {
+		return ids
+	}
+	for _, o := range snap.Proxies {
+		b := dsm.Object(o, "backend")
+		if dsm.ID(o) != p.NativeID && dsm.String(b, "fqdn") == "127.0.0.1" && dsm.Number(b, "port") == p.LoopbackPort {
+			ids = append(ids, dsm.ID(o))
+		}
+	}
+	return ids
+}
 func (a *App) ApplyRules(ctx context.Context) error { return a.applyRulesFor(ctx, nil) }
 func (a *App) applyRulesFor(ctx context.Context, p *model.ProxyHost) error {
 	in, e := a.RenderInput()
 	if e != nil {
 		return e
+	}
+	if p != nil && !p.Enabled {
+		var snapshot model.DSMSnapshot
+		_ = a.Store.Get("snapshot", "main", &snapshot)
+		if len(dependentProxies(snapshot, *p)) > 0 {
+			var previous model.ProxyHost
+			if a.Store.Get("applied-proxies", p.ID, &previous) == nil {
+				previous.Advanced.ForceSSL = false
+				p = &previous
+			}
+		}
 	}
 	if p != nil {
 		found := false
@@ -417,6 +487,42 @@ func (a *App) Certificate(ctx context.Context, id string, renew, deployOnly bool
 				p.AutoRenew = false
 				return errors.New("certificate was removed in DSM; automatic recreation stopped")
 			}
+			var current map[string]string
+			if e = a.Broker.Call(ctx, broker.Request{Action: "native-certificate-info", ID: p.NativeID}, &current); e != nil {
+				return e
+			}
+			fp, _, err := dsm.Fingerprint([]byte(current["certificate"]))
+			if err != nil {
+				return err
+			}
+			if p.Fingerprint != "" && fp != p.Fingerprint && fp != p.PendingFingerprint {
+				p.Managed = false
+				p.AutoRenew = false
+				p.Status = "changed_in_dsm"
+				p.PendingFingerprint = ""
+				a.ACME.Stop(p.ID)
+				return errors.New("certificate changed in DSM; automatic replacement stopped")
+			}
+			if e = a.rememberCertificate(ctx, snap, p.NativeID); e != nil {
+				return e
+			}
+		}
+		// Recover a successful native import whose ID persistence was interrupted.
+		if p.NativeID == "" {
+			desc := "SynoHarbor: " + p.Domain + " [" + p.ID + "]"
+			for _, o := range snap.Certificates {
+				if dsm.String(o, "desc") == desc {
+					var material map[string]string
+					if e = a.Broker.Call(ctx, broker.Request{Action: "native-certificate-info", ID: dsm.ID(o)}, &material); e != nil {
+						return e
+					}
+					fp, _, err := dsm.Fingerprint([]byte(material["certificate"]))
+					if err != nil || fp != fingerprint {
+						return errors.New("a different native certificate already uses this profile identity")
+					}
+					p.NativeID = dsm.ID(o)
+				}
+			}
 		}
 		nativeID, e := c.ImportCertificate(ctx, p.NativeID, "SynoHarbor: "+p.Domain+" ["+p.ID+"]", key, cert)
 		if e != nil {
@@ -424,6 +530,9 @@ func (a *App) Certificate(ctx context.Context, id string, renew, deployOnly bool
 		}
 		p.NativeID = nativeID
 		p.Fingerprint = fingerprint
+		if e = a.recordCertificate(p); e != nil {
+			return e
+		}
 		p.PendingFingerprint = ""
 		p.LastDeployed = time.Now().UTC()
 		p.Status = "ready"
@@ -498,10 +607,34 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 		if e != nil {
 			return e
 		}
+		if e = a.rememberProxy(snap, p); e != nil {
+			return e
+		}
+		if p.NativeID == "" && p.Enabled {
+			for _, o := range snap.Proxies {
+				front, back := dsm.Object(o, "frontend"), dsm.Object(o, "backend")
+				if dsm.String(front, "fqdn") != p.Hostname || dsm.Number(front, "port") != 443 {
+					continue
+				}
+				if dsm.String(o, "description") != "SynoHarbor: "+p.Hostname || dsm.String(back, "fqdn") != "127.0.0.1" || dsm.Number(back, "port") != p.LoopbackPort {
+					return errors.New("another native proxy already uses this hostname")
+				}
+				p.NativeID = dsm.ID(o)
+			}
+		}
 		if p.NativeID != "" {
 			found := false
 			for _, o := range snap.Proxies {
-				found = found || dsm.ID(o) == p.NativeID
+				if dsm.ID(o) == p.NativeID {
+					found = true
+					if p.NativeHash != "" && model.Hash(o) != p.NativeHash {
+						var own NativeChange
+						_ = a.Store.Get("native-changes", "proxy-"+p.ID, &own)
+						if own.ExpectedHash != model.Hash(o) {
+							return errors.New("proxy changed in DSM; refresh before applying this edit")
+						}
+					}
+				}
 			}
 			if !found {
 				return errors.New("proxy was removed in DSM; refresh before editing")
@@ -514,7 +647,22 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 				}
 			}
 			p.NativeID = ""
+			current, e := c.Snapshot(ctx)
+			if e != nil {
+				return e
+			}
+			var previous model.DSMSnapshot
+			_ = a.Store.Get("snapshot", "main", &previous)
+			current.Meta = previous.Meta
+			current.ID = "main"
+			current.HTTP2 = previous.HTTP2
+			if e = a.Store.Put("snapshot", &current.Meta, &current); e != nil {
+				return e
+			}
 			p.Status = "disabled"
+			if len(dependentProxies(current, p)) > 0 {
+				p.Message = "Proxy disabled; internal rules retained for dependent DSM routes"
+			}
 			p.HTTPSVerified = false
 			return a.Store.Put("proxies", &p.Meta, &p)
 		}
@@ -527,6 +675,17 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 		if e = a.Store.Put("proxies", &p.Meta, &p); e != nil {
 			return e
 		}
+		written, e := c.Snapshot(ctx)
+		if e != nil {
+			return e
+		}
+		for _, o := range written.Proxies {
+			if dsm.ID(o) == p.NativeID {
+				if e = a.recordProxy(p, o); e != nil {
+					return e
+				}
+			}
+		}
 		if e = c.Bind(ctx, cert.NativeID, p.NativeID); e != nil {
 			return e
 		}
@@ -537,6 +696,9 @@ func (a *App) Proxy(ctx context.Context, id string) error {
 		for _, o := range current.Proxies {
 			if dsm.ID(o) == p.NativeID {
 				p.NativeHash = model.Hash(o)
+				if e = a.recordProxy(p, o); e != nil {
+					return e
+				}
 			}
 		}
 		return nil
@@ -619,6 +781,15 @@ func (a *App) AdoptCertificate(ctx context.Context, p model.CertificateProfile) 
 	if e := p.Validate(); e != nil {
 		return e
 	}
+	if e := a.withDSM(ctx, false, "", func(c *dsm.Client) error {
+		snap, e := c.Snapshot(ctx)
+		if e != nil {
+			return e
+		}
+		return a.rememberCertificate(ctx, snap, p.NativeID)
+	}); e != nil {
+		return e
+	}
 	var material map[string]string
 	if e := a.Broker.Call(ctx, broker.Request{Action: "native-certificate", ID: p.NativeID}, &material); e != nil {
 		return e
@@ -658,7 +829,12 @@ func (a *App) DeletePreview(kind, id string) (any, error) {
 		if e := a.Store.Get(kind, id, &p); e != nil {
 			return nil, e
 		}
-		return map[string]any{"proxyId": p.NativeID, "hostname": p.Hostname, "certificate": "Preserved; certificates are deleted separately", "advancedRules": p.Managed}, nil
+		deps := dependentProxies(snap, p)
+		preview := map[string]any{"proxyId": p.NativeID, "hostname": p.Hostname, "certificate": "Preserved; certificates are deleted separately", "advancedRules": p.Managed, "dependentNativeProxies": deps, "blocked": len(deps) > 0}
+		if p.AppUI {
+			preview["accessWarning"] = "This removes the standalone SynoHarbor address. Open the app from the DSM desktop to configure access again."
+		}
+		return preview, nil
 	}
 	var cert model.CertificateProfile
 	if e := a.Store.Get("certificates", id, &cert); e != nil {
@@ -688,8 +864,23 @@ func (a *App) Delete(ctx context.Context, kind, id string) error {
 		if e := a.Store.Get(kind, id, &p); e != nil {
 			return e
 		}
+		if e := a.withDSM(ctx, false, "", func(c *dsm.Client) error {
+			snap, e := c.Snapshot(ctx)
+			if e != nil {
+				return e
+			}
+			if len(dependentProxies(snap, p)) > 0 {
+				return errors.New("other DSM proxies depend on this Advanced listener; edit or adopt those routes before deleting it")
+			}
+			return nil
+		}); e != nil {
+			return e
+		}
 		if p.NativeID != "" && !p.ExternalDeleted {
 			if e := a.withDSM(ctx, false, "", func(c *dsm.Client) error { return c.DeleteProxy(ctx, p.NativeID) }); e != nil {
+				return e
+			}
+			if e := a.markRemoved("proxy", p.ID); e != nil {
 				return e
 			}
 		}
@@ -744,6 +935,7 @@ func (a *App) Run(ctx context.Context) error {
 	defer jobs.Wait()
 	objectLocks := map[string]*sync.Mutex{}
 	nextSync, nextRenew := time.Time{}, time.Time{}
+	var nextBackup time.Time
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -754,9 +946,20 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		if time.Now().After(nextSync) {
 			syncCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-			_ = a.Sync(syncCtx)
+			if unlock, err := a.Store.Gate(syncCtx, false); err == nil {
+				if e := a.Sync(syncCtx); e == nil {
+					if _, e = os.Stat(filepath.Join(a.Store.Dir, "recovered")); e == nil {
+						_, _ = a.Store.Enqueue("rules.apply", "recovered", nil)
+					}
+				}
+				unlock()
+			}
 			cancel()
 			nextSync = time.Now().Add(30 * time.Second)
+		}
+		if time.Now().After(nextBackup) {
+			_, _ = a.Store.Enqueue("backup.create", "automatic", nil)
+			nextBackup = time.Now().Add(24 * time.Hour)
 		}
 		if time.Now().After(nextRenew) {
 			a.startRenewals(ctx)
@@ -794,9 +997,49 @@ func (a *App) Run(ctx context.Context) error {
 func (a *App) execute(ctx context.Context, op model.Operation) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
+	exclusive := op.Kind == "backup.create" || op.Kind == "recovery.prepare" || op.Kind == "proxy.delete" || op.Kind == "certificate.delete"
+	unlock, lockErr := a.Store.Gate(ctx, exclusive)
+	if lockErr != nil {
+		_ = a.Store.Finish(op.ID, lockErr)
+		return
+	}
+	defer unlock()
+	if a.managementPaused() && op.Kind != "recovery.prepare" && op.Kind != "backup.create" && op.Kind != "sync" {
+		_ = a.Store.Finish(op.ID, errors.New("management is paused for uninstall recovery"))
+		return
+	}
 	_ = a.Store.Stage(op.ID, "Processing "+op.Kind)
+	var startVersion int
+	if strings.HasPrefix(op.Kind, "proxy.") {
+		var p model.ProxyHost
+		if a.Store.Get("proxies", op.ObjectID, &p) == nil {
+			startVersion = p.Version
+		}
+	} else if strings.HasPrefix(op.Kind, "certificate.") {
+		var p model.CertificateProfile
+		if a.Store.Get("certificates", op.ObjectID, &p) == nil {
+			startVersion = p.Version
+		}
+	}
 	var e error
+	if op.Kind == "proxy.delete" || op.Kind == "certificate.delete" {
+		if _, e = a.CreateBackup(ctx, "before-delete"); e != nil {
+			_ = a.Store.Finish(op.ID, e)
+			return
+		}
+	}
 	switch op.Kind {
+	case "backup.create":
+		_, e = a.CreateBackup(ctx, op.ObjectID)
+	case "recovery.prepare":
+		var request struct {
+			Token string `json:"token"`
+		}
+		if json.Unmarshal(op.Request, &request) != nil {
+			e = errors.New("invalid restore confirmation")
+		} else {
+			e = a.PrepareUninstall(ctx, request.Token)
+		}
 	case "certificate.issue":
 		e = a.Certificate(ctx, op.ObjectID, false, false)
 	case "certificate.renew":
@@ -810,17 +1053,43 @@ func (a *App) execute(ctx context.Context, op model.Operation) {
 	case "proxy.delete":
 		e = a.Delete(ctx, "proxies", op.ObjectID)
 	case "certificate.delete":
+		var deleting model.CertificateProfile
+		_ = a.Store.Get("certificates", op.ObjectID, &deleting)
 		e = a.Delete(ctx, "certificates", op.ObjectID)
+		if e == nil && deleting.NativeID != "" {
+			e = a.markRemoved("certificate", deleting.NativeID)
+		}
 	case "sync":
 		e = a.Sync(ctx)
 	case "rules.apply":
 		e = a.ApplyRules(ctx)
+		if e == nil && op.ObjectID == "recovered" {
+			_ = os.Remove(filepath.Join(a.Store.Dir, "recovered"))
+		}
 	default:
 		e = errors.New("unsupported operation")
 	}
 	_ = a.Store.Finish(op.ID, e)
+	// A save during a running operation must not be swallowed by active-job
+	// deduplication. Only a newer user-queued revision schedules a follow-up.
+	if startVersion > 0 && op.Kind == "proxy.apply" {
+		var p model.ProxyHost
+		if a.Store.Get("proxies", op.ObjectID, &p) == nil && p.Status == "queued" && p.Version > startVersion {
+			_, _ = a.Store.Enqueue("proxy.apply", p.ID, nil)
+		}
+	}
+	if startVersion > 0 && (op.Kind == "certificate.issue" || op.Kind == "certificate.renew" || op.Kind == "certificate.deploy") {
+		var p model.CertificateProfile
+		if a.Store.Get("certificates", op.ObjectID, &p) == nil && p.Status == "queued" && p.Version > startVersion {
+			_, _ = a.Store.Enqueue("certificate.issue", p.ID, nil)
+		}
+	}
 }
 func (a *App) startRenewals(ctx context.Context) {
+	if a.managementPaused() {
+		a.ACME.Close()
+		return
+	}
 	var profiles []model.CertificateProfile
 	if a.Store.List("certificates", &profiles) != nil {
 		return
@@ -858,7 +1127,21 @@ func (a *App) startRenewals(ctx context.Context) {
 func sha256Sum(b []byte) []byte { sum := sha256.Sum256(b); return sum[:] }
 
 func (a *App) SetHTTP2(ctx context.Context, enabled bool) error {
-	return a.withDSM(ctx, false, "", func(c *dsm.Client) error { return c.SetHTTP2(ctx, enabled) })
+	return a.withDSM(ctx, false, "", func(c *dsm.Client) error {
+		before, e := c.HTTP2(ctx)
+		if e != nil {
+			return e
+		}
+		state := a.recoveryState()
+		if state.HTTP2Before == nil {
+			state.HTTP2Before = &before
+		}
+		state.HTTP2After = &enabled
+		if e = a.Store.Put("recovery", &state.Meta, &state); e != nil {
+			return e
+		}
+		return c.SetHTTP2(ctx, enabled)
+	})
 }
 
 func (a *App) DeleteCredential(id string) error {
@@ -875,8 +1158,5 @@ func (a *App) DeleteCredential(id string) error {
 	if e := a.Store.Get("credentials", id, &c); e != nil {
 		return e
 	}
-	if e := a.Store.Delete("credentials", id, c.Version); e != nil {
-		return e
-	}
-	return a.Store.DeleteSecret("cloudflare:" + id)
+	return a.Store.DeleteCredential(id, c.Version)
 }

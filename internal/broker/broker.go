@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,10 +18,14 @@ import (
 
 	"github.com/lefterry/synoharbor/internal/model"
 	"github.com/lefterry/synoharbor/internal/nginx"
+	"github.com/lefterry/synoharbor/internal/recovery"
 )
 
 const Socket = "/var/run/synoharbor-broker.sock"
 const Config = "/usr/local/etc/nginx/sites-enabled/synoharbor.conf"
+const Protocol = 2
+
+var Build string
 
 type Request struct {
 	Action  string      `json:"action"`
@@ -29,9 +34,11 @@ type Request struct {
 	Message string      `json:"message"`
 }
 type Response struct {
-	OK    bool            `json:"ok"`
-	Error string          `json:"error,omitempty"`
-	Data  json.RawMessage `json:"data,omitempty"`
+	Build    string          `json:"build,omitempty"`
+	Protocol int             `json:"protocol"`
+	OK       bool            `json:"ok"`
+	Error    string          `json:"error,omitempty"`
+	Data     json.RawMessage `json:"data,omitempty"`
 }
 type Client struct{ Path string }
 
@@ -56,6 +63,12 @@ func (c Client) Call(ctx context.Context, r Request, out any) error {
 	if !resp.OK {
 		return errors.New(resp.Error)
 	}
+	if resp.Protocol != Protocol {
+		return errors.New("broker upgrade requires administrator activation; open Settings")
+	}
+	if Build != "" && resp.Build != Build {
+		return errors.New("broker upgrade requires administrator activation; open Settings")
+	}
 	if out != nil {
 		return json.Unmarshal(resp.Data, out)
 	}
@@ -66,11 +79,13 @@ type System struct {
 	ConfigPath string
 	Root       string
 	Run        func(context.Context, string, ...string) error
+	Archives   recovery.Archives
 	mu         sync.Mutex
 }
 
 func NativeSystem() *System {
-	return &System{ConfigPath: Config, Root: nginx.Root, Run: func(ctx context.Context, path string, args ...string) error {
+	data, _ := filepath.EvalSymlinks("/var/packages/synoharbor/var")
+	return &System{ConfigPath: Config, Root: nginx.Root, Archives: recovery.Archives{Data: data, Root: filepath.Join(filepath.Dir(data), "synoharbor-backups")}, Run: func(ctx context.Context, path string, args ...string) error {
 		cmd := exec.CommandContext(ctx, path, args...)
 		cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
 		if e := cmd.Run(); e != nil {
@@ -89,17 +104,22 @@ func (s *System) Apply(ctx context.Context, input nginx.Input) error {
 	if e = os.MkdirAll(s.Root, 0750); e != nil {
 		return e
 	}
+	if e = os.Chmod(s.Root, 0750); e != nil {
+		return e
+	}
 	if httpUser, e := user.Lookup("http"); e == nil {
 		gid, _ := strconv.Atoi(httpUser.Gid)
 		os.Chown(s.Root, 0, gid)
-		os.MkdirAll("/usr/local/var/cache/synoharbor", 0750)
+		os.MkdirAll(filepath.Join(s.Root, "cache"), 0750)
 		uid, _ := strconv.Atoi(httpUser.Uid)
-		os.Chown("/usr/local/var/cache/synoharbor", uid, gid)
+		os.Chown(filepath.Join(s.Root, "cache"), uid, gid)
+		os.Chmod(filepath.Join(s.Root, "cache"), 0750)
 	}
 	if e = os.MkdirAll(filepath.Dir(s.ConfigPath), 0755); e != nil {
 		return e
 	}
 	previous := map[string][]byte{}
+	previousInfo := map[string]os.FileInfo{}
 	missing := map[string]bool{}
 	writes := map[string][]byte{s.ConfigPath: []byte(bundle.Config)}
 	for name, b := range bundle.Files {
@@ -113,7 +133,31 @@ func (s *System) Apply(ctx context.Context, input nginx.Input) error {
 			return e
 		} else {
 			previous[p] = b
+			previousInfo[p], _ = os.Stat(p)
 		}
+	}
+	same := len(missing) == 0
+	for p, b := range writes {
+		if !bytes.Equal(previous[p], b) {
+			same = false
+			break
+		}
+	}
+	if same {
+		if g, err := user.LookupGroup("http"); err == nil {
+			gid, _ := strconv.Atoi(g.Gid)
+			for p := range writes {
+				if p != s.ConfigPath {
+					_ = os.Chown(p, 0, gid)
+					_ = os.Chmod(p, 0640)
+				}
+			}
+		}
+		if e = s.Run(ctx, "/usr/bin/nginx", "-t"); e != nil {
+			return e
+		}
+		s.prune(writes)
+		return nil
 	}
 	restore := func() {
 		for p := range writes {
@@ -121,6 +165,10 @@ func (s *System) Apply(ctx context.Context, input nginx.Input) error {
 				os.Remove(p)
 			} else {
 				_ = atomicWrite(p, previous[p], 0640)
+				if info := previousInfo[p]; info != nil {
+					_ = os.Chmod(p, info.Mode().Perm())
+					restoreOwner(p, info)
+				}
 			}
 		}
 	}
@@ -146,7 +194,11 @@ func (s *System) Apply(ctx context.Context, input nginx.Input) error {
 		_ = s.Run(ctx, "/usr/bin/nginx", "-s", "reload")
 		return e
 	}
-	// Remove only previously owned credential/trust files after successful reload.
+	s.prune(writes)
+	return nil
+}
+func (s *System) prune(writes map[string][]byte) {
+	// Remove only previously owned credential/trust files no longer referenced.
 	files, _ := os.ReadDir(s.Root)
 	for _, f := range files {
 		if strings.HasSuffix(f.Name(), ".htpasswd") || strings.HasSuffix(f.Name(), ".trust.pem") {
@@ -156,7 +208,6 @@ func (s *System) Apply(ctx context.Context, input nginx.Input) error {
 			}
 		}
 	}
-	return nil
 }
 func atomicWrite(path string, b []byte, mode os.FileMode) error {
 	f, e := os.CreateTemp(filepath.Dir(path), ".synoharbor-*")
@@ -211,7 +262,7 @@ func Serve(ctx context.Context, path string, uid, gid int, system *System) error
 				return
 			}
 			data, e := system.handle(ctx, r)
-			resp := Response{OK: e == nil}
+			resp := Response{OK: e == nil, Protocol: Protocol, Build: Build}
 			if e != nil {
 				resp.Error = e.Error()
 			} else {
@@ -224,7 +275,45 @@ func Serve(ctx context.Context, path string, uid, gid int, system *System) error
 func (s *System) handle(ctx context.Context, r Request) (any, error) {
 	switch r.Action {
 	case "status":
-		return map[string]bool{"ready": true}, nil
+		return map[string]any{"ready": true, "protocol": Protocol}, nil
+	case "backup-list":
+		return s.Archives.List()
+	case "backup-create":
+		return s.Archives.Create(ctx, r.Message)
+	case "recovery-status":
+		status, e := recovery.ReadStatus()
+		if errors.Is(e, os.ErrNotExist) {
+			return recovery.Status{State: "idle"}, nil
+		}
+		return status, e
+	case "backup-restore":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if current, e := recovery.ReadStatus(); e == nil && (current.State == "starting" || current.State == "running") && time.Since(current.UpdatedAt) < 10*time.Minute {
+			return nil, errors.New("another settings recovery is already running")
+		}
+		if e := s.Archives.Validate(r.ID); e != nil {
+			return nil, e
+		}
+		status := recovery.Status{ID: r.ID, State: "starting", Message: "Restoring private settings; the app will reconnect automatically"}
+		if e := recovery.WriteStatus(status); e != nil {
+			return nil, e
+		}
+		log, e := os.OpenFile(filepath.Join(s.Archives.Root, "recovery.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if e != nil {
+			return nil, e
+		}
+		cmd := exec.Command("/usr/local/libexec/synoharbor/synoharbor", "recover", r.ID)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
+		cmd.Stdout = log
+		cmd.Stderr = log
+		if e = cmd.Start(); e != nil {
+			log.Close()
+			_ = recovery.WriteStatus(recovery.Status{ID: r.ID, State: "failed", Message: "Could not start immutable recovery helper"})
+			return nil, errors.New("could not start recovery helper")
+		}
+		go func() { _ = cmd.Wait(); _ = log.Close() }()
+		return status, nil
 	case "apply":
 		return nil, s.Apply(ctx, r.Config)
 	case "http2":

@@ -19,6 +19,10 @@ actual verification state; this is not yet a completed v0.1 release.
 - IP allow/deny plus SHA512-crypt Basic Auth; global native DSM HTTP/2 setting.
 - Native change/deletion synchronization and durable retryable deployments.
 - Explicit browser-session, administrator and session-bound CSRF validation.
+- Full private backups, in-app settings recovery and scoped DSM rollback before uninstall.
+- Contextual information buttons and transparent native DSM icons.
+- Optional standalone HTTPS page: Settings issues its certificate, creates the native
+  route and enables Force SSL. DSM administrator login/OTP stays separate from renewal.
 
 Permanent DNS records and Cloudflare token rotation are outside the scope.
 
@@ -53,9 +57,16 @@ Settings shows whether activation is complete.
 Start in Settings: add a Cloudflare credential, then connect the DSM administrator account and register a SynoHarbor trusted
 device with a current OTP. Passwords, tokens and keys remain on the NAS.
 
+To add a standalone address, open **Settings → Standalone access**, enter a hostname
+already resolving to this NAS, select an ACME email and saved Cloudflare credential,
+then choose **Set up certificate & proxy**. Repeating setup reuses existing resources.
+The page also remains available inside DSM.
+
 Stopping the package leaves the last valid nginx configuration serving traffic.
-Renewal requires the worker to run. Uninstall preserves native services and
-private state; remove managed services in the app before uninstalling if desired.
+Renewal requires the worker to run. Uninstall defaults to keeping services and
+settings. Settings → Backup & Recovery previews a scoped DSM restore before the
+other uninstall choices become available. Full private backups survive removal;
+see [recovery and uninstall](docs/recovery.md).
 
 ## License and provenance
 

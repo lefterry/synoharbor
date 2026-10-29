@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/GehirnInc/crypt/sha512_crypt"
 	"github.com/google/uuid"
@@ -22,12 +21,22 @@ import (
 )
 
 type API struct {
-	App    *service.App
-	Verify func(context.Context, auth.Env) (string, string, int, error)
-	Env    auth.Env
+	App      *service.App
+	Verify   func(context.Context, auth.Env) (string, string, int, error)
+	Env      auth.Env
+	Sessions *auth.Sessions
 }
 
-func New(a *service.App) *API { return &API{App: a, Verify: auth.Native().Verify, Env: os.Getenv} }
+func New(a *service.App) *API {
+	sessions := auth.NewSessions(a.Store)
+	return &API{App: a, Env: os.Getenv, Sessions: sessions, Verify: func(ctx context.Context, env auth.Env) (string, string, int, error) {
+		_, present, _ := auth.OwnCookie(env)
+		if present {
+			return sessions.Verify(ctx, env)
+		}
+		return auth.Native().Verify(ctx, env)
+	}}
+}
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -53,7 +62,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "session" && r.Method == "GET" {
-		reply(w, 200, map[string]string{"user": name, "csrfToken": token}, nil)
+		mode := "dsm"
+		if _, present, _ := auth.OwnCookie(a.Env); present {
+			mode = "standalone"
+		}
+		reply(w, 200, map[string]string{"user": name, "csrfToken": token, "authMode": mode}, nil)
 		return
 	}
 	if !hmac.Equal([]byte(r.Header.Get("X-SynoHarbor-CSRF")), []byte(token)) {
@@ -64,6 +77,22 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		media, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if e != nil || media != "application/json" {
 			reply(w, 415, nil, errors.New("application/json required"))
+			return
+		}
+		unlock, err := a.App.Store.Gate(r.Context(), path == "standalone")
+		if err != nil {
+			reply(w, 503, nil, errors.New("recovery is busy; retry shortly"))
+			return
+		}
+		defer unlock()
+		if path == "signout" && r.Method == "POST" {
+			e := a.Sessions.Logout(r.Context(), a.Env)
+			http.SetCookie(w, auth.ClearSessionCookie())
+			reply(w, 200, nil, e)
+			return
+		}
+		if a.App.RecoveryPaused() && path != "connection" && path != "backup" && path != "recovery/prepare" && path != "restore-backup" {
+			reply(w, 409, nil, errors.New("management is paused for recovery; finish rollback before uninstalling"))
 			return
 		}
 	}
@@ -127,7 +156,7 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			_ = s.Get("snapshot", "main", &snapshot)
 			ops, e := s.Operations()
 			brokerReady := a.App.Broker.Call(ctx, broker.Request{Action: "status"}, nil) == nil
-			return map[string]any{"brokerReady": brokerReady, "certificates": certs, "proxies": proxies, "accessLists": lists, "credentials": credentials, "snapshot": snapshot, "operations": ops, "settings": a.App.Settings()}, e
+			return map[string]any{"build": broker.Build, "brokerReady": brokerReady, "certificates": certs, "proxies": proxies, "accessLists": lists, "credentials": credentials, "snapshot": snapshot, "operations": ops, "settings": a.App.Settings()}, e
 		case "operations":
 			if id != "" {
 				return s.Operation(id)
@@ -135,6 +164,16 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			return s.Operations()
 		case "settings":
 			return a.App.Settings(), nil
+		case "standalone":
+			return a.App.Standalone(), nil
+		case "backups":
+			return a.App.Backups(ctx)
+		case "recovery":
+			return a.App.RecoveryPreview(ctx)
+		case "recovery-status":
+			var status any
+			e := a.App.Broker.Call(ctx, broker.Request{Action: "recovery-status"}, &status)
+			return status, e
 		case "proxies", "certificates":
 			if action == "delete-preview" {
 				return a.App.DeletePreview(kind, id)
@@ -146,6 +185,12 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 		switch kind {
 		case "sync":
 			return s.Enqueue("sync", "main", nil)
+		case "standalone":
+			var req service.StandaloneRequest
+			if e := decode(r, &req); e != nil {
+				return nil, e
+			}
+			return a.App.SetupStandalone(ctx, req)
 		case "preview":
 			var p model.ProxyHost
 			if e := decode(r, &p); e != nil {
@@ -177,7 +222,8 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			if len(req.OTP) != 0 && (len(req.OTP) != 6 || strings.Trim(req.OTP, "0123456789") != "") {
 				return nil, errors.New("enter the current six-digit OTP")
 			}
-			return a.App.Settings(), a.App.Connect(ctx, req.Account, req.Password, req.OTP, req.Port)
+			e := a.App.Connect(ctx, req.Account, req.Password, req.OTP, req.Port)
+			return a.App.Settings(), e
 		case "http2":
 			var req struct {
 				Enabled bool `json:"enabled"`
@@ -187,8 +233,35 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			}
 			return nil, a.App.SetHTTP2(ctx, req.Enabled)
 		case "backup":
-			name := "backup-" + time.Now().UTC().Format("20060102T150405") + ".sqlite"
-			return map[string]string{"file": name, "note": "Encrypted database backup retained in private package storage; include master.key and acme/ in a full filesystem backup"}, s.Backup(ctx, filepath.Join(s.Dir, name))
+			return s.Enqueue("backup.create", "manual", nil)
+		case "restore-backup":
+			var req struct {
+				ID           string `json:"id"`
+				Confirmation string `json:"confirmation"`
+			}
+			if e := decode(r, &req); e != nil {
+				return nil, e
+			}
+			if req.Confirmation != "RESTORE SETTINGS" {
+				return nil, errors.New("confirm the selected private settings backup first")
+			}
+			var status any
+			e := a.App.Broker.Call(ctx, broker.Request{Action: "backup-restore", ID: req.ID}, &status)
+			return status, e
+		case "recovery":
+			var req struct {
+				Token string `json:"token"`
+			}
+			if id != "prepare" {
+				return nil, errors.New("unknown recovery action")
+			}
+			if e := decode(r, &req); e != nil {
+				return nil, e
+			}
+			if len(req.Token) != 64 {
+				return nil, errors.New("preview and confirm the exact DSM restore first")
+			}
+			return s.Enqueue("recovery.prepare", "main", req)
 		case "credentials":
 			var req struct {
 				model.Credential
@@ -204,9 +277,6 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 				req.ID = uuid.NewString()
 			}
 			if req.Token != "" {
-				if e := s.PutSecret("cloudflare:"+req.ID, req.Token); e != nil {
-					return nil, e
-				}
 				req.Configured = true
 			} else {
 				var old string
@@ -214,8 +284,10 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 					return nil, errors.New("Cloudflare API token required")
 				}
 				req.Configured = true
+				req.Token = old
 			}
-			return req.Credential, s.Put("credentials", &req.Meta, &req.Credential)
+			e := s.PutSecretObject("credentials", &req.Meta, &req.Credential, "cloudflare:"+req.ID, req.Token)
+			return req.Credential, e
 		case "certificates":
 			if action == "replace" {
 				return s.Enqueue("certificate.replace", id, nil)
@@ -353,10 +425,7 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 				}
 				req.Users[i].Configured = true
 			}
-			if e := s.PutSecret("access:"+req.ID, next); e != nil {
-				return nil, e
-			}
-			if e := s.Put("access", &req.Meta, &req.AccessList); e != nil {
+			if e := s.PutSecretObject("access", &req.Meta, &req.AccessList, "access:"+req.ID, next); e != nil {
 				return nil, e
 			}
 			return s.Enqueue("rules.apply", req.ID, nil)
@@ -372,7 +441,8 @@ func (a *API) route(r *http.Request, path string) (any, error) {
 			}
 			settings := a.App.Settings()
 			settings.Theme = req.Theme
-			return settings, s.Put("settings", &settings.Meta, &settings)
+			e := s.Put("settings", &settings.Meta, &settings)
+			return settings, e
 		}
 	}
 	if r.Method == "DELETE" {
@@ -404,6 +474,15 @@ func (a *API) saveProxy(p model.ProxyHost, enqueue bool) (any, error) {
 	s := a.App.Store
 	var old model.ProxyHost
 	if p.ID != "" && s.Get("proxies", p.ID, &old) == nil {
+		if old.AppUI {
+			if p.Hostname != old.Hostname {
+				return nil, errors.New("configure standalone access in Settings")
+			}
+			version, enabled := p.Version, p.Enabled
+			p = old
+			p.Version = version
+			p.Enabled = enabled
+		}
 		p.NativeID = old.NativeID
 		p.NativeHash = old.NativeHash
 		p.LoopbackPort = old.LoopbackPort
@@ -415,6 +494,9 @@ func (a *API) saveProxy(p model.ProxyHost, enqueue bool) (any, error) {
 		if p.Hostname != old.Hostname {
 			p.HTTPSVerified = false
 		}
+	}
+	if p.AppUI && !old.AppUI {
+		return nil, errors.New("create standalone access in Settings")
 	}
 	if p.ID == "" {
 		p.ID = uuid.NewString()

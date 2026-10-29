@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+[ "${SYNOPKG_PKG_STATUS:-}" = UNINSTALL ] || exit 0
+BIN=/var/packages/synoharbor/target/bin/synoharbor
+mode=keep
+if [ "${synoharbor_restore:-false}" = true ]; then mode=restore; fi
+if [ "${synoharbor_erase:-false}" = true ]; then mode=erase; fi
+if ! "$BIN" uninstall-check "$mode" >"${SYNOPKG_TEMP_LOGFILE:-/dev/stderr}" 2>&1; then
+ exit 1
+fi

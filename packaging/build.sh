@@ -16,7 +16,7 @@ for arch in amd64 arm64; do
  cp -R packaging/spk/ui/. "$stage/package/ui/"
  cp -R web/dist/. "$stage/package/ui/"
  cp LICENSE NOTICE "$stage/package/"
- chmod 755 "$stage/package/ui/api.cgi"
+ chmod 755 "$stage/package/ui/api.cgi" "$stage/package/ui/signin.cgi"
  (cd "$stage/package" && tar -czf "$stage/package.tgz" bin ui LICENSE NOTICE)
  cp -R packaging/spk/scripts packaging/spk/conf packaging/spk/WIZARD_UIFILES "$stage/"
  chmod 755 "$stage/scripts/"*
@@ -24,7 +24,7 @@ for arch in amd64 arm64; do
  sed -e "s/^arch=.*/arch=\"$dsmarch\"/" -e "s/^version=.*/version=\"$VERSION\"/" packaging/spk/INFO > "$stage/INFO"
  for pair in 'package_icon:64' 'package_icon_256:256'; do
   key=${pair%:*};size=${pair#*:}
-  printf '%s="%s"\n' "$key" "$(base64 < "packaging/spk/ui/images/synoharbor_$size.png" | tr -d '\n')" >> "$stage/INFO"
+  printf '%s="%s"\n' "$key" "$(base64 < "packaging/spk/ui/images/synoharbor2_$size.png" | tr -d '\n')" >> "$stage/INFO"
  done
  (cd "$stage" && tar -cf "$OUT/synoharbor-$arch.spk" INFO package.tgz scripts conf WIZARD_UIFILES)
  rm -rf "$stage"

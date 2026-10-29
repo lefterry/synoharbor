@@ -10,7 +10,6 @@ mkdir -p /usr/local/lib/systemd/system/pkgctl-synoharbor.service.d
 cat >/usr/local/lib/systemd/system/synoharbor-broker.service <<'UNIT'
 [Unit]
 Description=SynoHarbor restricted nginx broker
-PartOf=pkgctl-synoharbor.service
 ConditionPathExists=/var/packages/synoharbor/INFO
 [Service]
 Type=simple

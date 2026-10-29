@@ -1,9 +1,11 @@
 #!/bin/sh
 set -eu
 umask 077
+# Consistent database snapshot + private ACME/key archive, outside the package.
+# Browser CGI requests may still run after the worker stops; tarring a live var
+# directory races SQLite WAL creation/removal and is not a recoverable backup.
 VAR=/var/packages/synoharbor/var
-if [ -d "$VAR" ]; then
- mkdir -p "$VAR/backups"
- chmod 700 "$VAR/backups"
- tar --exclude=./backups --exclude=./broker.log --exclude=./broker.pid -czf "$VAR/backups/upgrade-$(date +%Y%m%dT%H%M%S).tgz" -C "$VAR" .
+BIN=/var/packages/synoharbor/target/bin/synoharbor
+if [ -f "$VAR/synoharbor.sqlite" ]; then
+ "$BIN" backup >/dev/null
 fi

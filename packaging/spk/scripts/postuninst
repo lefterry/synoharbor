@@ -1,4 +1,10 @@
 #!/bin/sh
-# Deliberately preserve data and native routes. Uninstall stops renewal; the DSM
-# proxies and their last valid access rules remain available for recovery.
+# Upgrades also invoke this hook. Never erase data during an upgrade.
+[ "${SYNOPKG_PKG_STATUS:-}" = UNINSTALL ] || exit 0
+if [ "${synoharbor_erase:-false}" = true ]; then
+ VAR=/var/packages/synoharbor/var
+ [ -s "$VAR/uninstall-ready.json" ] || exit 1
+ find "$VAR/." -mindepth 1 -maxdepth 1 -exec rm -rf '{}' +
+fi
+# Native services stay as selected. Root-private backups remain recoverable.
 exit 0

@@ -79,6 +79,7 @@ type Advanced struct {
 }
 type ProxyHost struct {
 	Meta
+	AppUI            bool     `json:"appUi,omitempty"`
 	Hostname         string   `json:"hostname"`
 	Target           Target   `json:"target"`
 	CertificateID    string   `json:"certificateId"`
@@ -200,6 +201,9 @@ func (p ProxyHost) Validate() error {
 		return errors.New("invalid managed port")
 	}
 	a := p.Advanced
+	if p.AppUI && (p.Target.Host != "127.0.0.1" || p.Target.Scheme != "https" || len(a.Locations) != 0 || len(a.Headers) != 0 || a.Snippet != "" || a.CacheAssets || a.WebSockets || p.AccessListID != "") {
+		return errors.New("standalone access uses fixed local application routes; configure it in Settings")
+	}
 	if a.ConnectTimeout < 0 || a.ConnectTimeout > 3600 || a.ReadTimeout < 0 || a.ReadTimeout > 86400 || a.SendTimeout < 0 || a.SendTimeout > 86400 || a.BodySizeMB < 0 || a.BodySizeMB > 1048576 {
 		return errors.New("advanced limits out of range")
 	}

@@ -55,6 +55,11 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	_, err = db.Exec(`CREATE TRIGGER IF NOT EXISTS credential_reference_insert BEFORE INSERT ON objects WHEN NEW.kind='certificates' AND json_extract(NEW.body,'$.credentialId') != '' AND NOT EXISTS(SELECT 1 FROM objects WHERE kind='credentials' AND id=json_extract(NEW.body,'$.credentialId')) BEGIN SELECT RAISE(ABORT,'Cloudflare credential is no longer available'); END; CREATE TRIGGER IF NOT EXISTS credential_reference_update BEFORE UPDATE ON objects WHEN NEW.kind='certificates' AND json_extract(NEW.body,'$.credentialId') != '' AND NOT EXISTS(SELECT 1 FROM objects WHERE kind='credentials' AND id=json_extract(NEW.body,'$.credentialId')) BEGIN SELECT RAISE(ABORT,'Cloudflare credential is no longer available'); END; CREATE TRIGGER IF NOT EXISTS credential_reference_delete BEFORE DELETE ON objects WHEN OLD.kind='credentials' AND EXISTS(SELECT 1 FROM objects WHERE kind='certificates' AND json_extract(body,'$.credentialId')=OLD.id AND coalesce(json_extract(body,'$.externalDeleted'),0)=0) BEGIN SELECT RAISE(ABORT,'Cloudflare credential is used by a certificate'); END;`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	os.Chmod(filepath.Join(dir, "synoharbor.sqlite"), 0600)
 	return s, nil
 }
@@ -161,6 +166,33 @@ func (s *Store) DeleteSecret(id string) error {
 	_, e := s.DB.Exec("DELETE FROM secrets WHERE id=?", id)
 	return e
 }
+func (s *Store) VerifySecrets() error {
+	rows, e := s.DB.Query("SELECT id FROM secrets")
+	if e != nil {
+		return e
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if e = rows.Scan(&id); e != nil {
+			rows.Close()
+			return e
+		}
+		ids = append(ids, id)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, id := range ids {
+		var raw json.RawMessage
+		if e = s.Secret(id, &raw); e != nil {
+			return errors.New("recovery secret decryption failed")
+		}
+	}
+	return nil
+}
 func (s *Store) Enqueue(kind, id string, request any) (model.Operation, error) {
 	// Deduplicate active work, while allowing an explicit retry after failure.
 	var existing string
@@ -235,6 +267,16 @@ func (s *Store) Backup(ctx context.Context, path string) error {
 	_, e := s.DB.ExecContext(ctx, "VACUUM INTO ?", path)
 	if e == nil {
 		e = os.Chmod(path, 0600)
+	}
+	if e == nil {
+		copyDB, err := sql.Open("sqlite", path)
+		if err != nil {
+			return err
+		}
+		_, e = copyDB.Exec("DELETE FROM objects WHERE kind='browser-sessions'; DELETE FROM secrets WHERE id LIKE 'browser-session:%'; UPDATE operations SET state='failed',message='Backup restored: retry this interrupted operation explicitly' WHERE state IN ('queued','running')")
+		if err = copyDB.Close(); e == nil {
+			e = err
+		}
 	}
 	return e
 }

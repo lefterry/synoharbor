@@ -21,7 +21,7 @@ func TestAdvancedRulesAndSSLReadiness(t *testing.T) {
 	if strings.Contains(b.Config, "return 308") {
 		t.Fatal("redirect enabled before HTTPS verification")
 	}
-	for _, want := range []string{"listen 127.0.0.1:18080", "real_ip_header X-Real-IP", "includeSubDomains", "proxy_set_header Upgrade", "proxy_cache synoharbor_assets", "$synoharbor_skip_asset", "$http_cookie", "location /api", "proxy_read_timeout 600s", "client_max_body_size 512m", "X-Frame-Options", "return 403"} {
+	for _, want := range []string{"listen 127.0.0.1:18080", "real_ip_header X-Real-IP", "includeSubDomains", "proxy_set_header Upgrade", "proxy_cache synoharbor_assets", "proxy_buffering on;", "proxy_cache off;", "$synoharbor_skip_asset", "$http_cookie", "location /api", "proxy_read_timeout 600s", "client_max_body_size 512m", "X-Frame-Options", "return 403"} {
 		if !strings.Contains(b.Config, want) {
 			t.Errorf("missing %s", want)
 		}
@@ -61,5 +61,27 @@ func TestSnippetIsolationAndAccess(t *testing.T) {
 	}
 	if !strings.Contains(string(b.Files["access-one.htpasswd"]), "terry:$6$") {
 		t.Fatal("DSM-compatible password hash missing")
+	}
+}
+
+func TestStandaloneOnlyExposesFixedPackagePaths(t *testing.T) {
+	p := host()
+	p.AppUI = true
+	p.Target = model.Target{Scheme: "https", Host: "127.0.0.1", Port: 5001}
+	b, e := Render(Input{Hosts: []model.ProxyHost{p}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, path := range []string{"location = / {", "location = /api.cgi {", "location = /signin.cgi {", "location / { return 404; }", "proxy_set_header Host 127.0.0.1", "https://127.0.0.1:5001/webman/3rdparty/synoharbor/", "proxy_ssl_session_reuse off;"} {
+		if !strings.Contains(b.Config, path) {
+			t.Fatal("missing fixed application routing", path)
+		}
+	}
+	if strings.Contains(b.Config, "syno.example.net") || strings.Contains(b.Config, "/webapi/") {
+		t.Fatal("route depends on desktop hostname or exposes DSM APIs")
+	}
+	p.Target.Host = "192.168.1.20"
+	if _, e = Render(Input{Hosts: []model.ProxyHost{p}}); e == nil {
+		t.Fatal("arbitrary management backend accepted")
 	}
 }
