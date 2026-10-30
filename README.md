@@ -113,3 +113,10 @@ has independent Git history. Inspired by the workflow of
 with no NPM source or branding included. SynoHarbor is an independent community
 project, not affiliated with Synology, DNSACME or Nginx Proxy Manager. No
 proprietary Synology assets are distributed.
+
+## Support the project
+
+If SynoHarbor makes managing your NAS a little easier, you can support its
+development through GitHub's **Sponsor** button when available. Sponsorship is
+optional. Reproducible bug reports, documentation improvements and results from
+testing on other DSM models are welcome too.
