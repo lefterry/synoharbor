@@ -77,7 +77,7 @@ func TestStandaloneOnlyExposesFixedPackagePaths(t *testing.T) {
 			t.Fatal("missing fixed application routing", path)
 		}
 	}
-	if strings.Contains(b.Config, "syno.example.net") || strings.Contains(b.Config, "/webapi/") {
+	if strings.Contains(b.Config, "desktop.example.net") || strings.Contains(b.Config, "/webapi/") {
 		t.Fatal("route depends on desktop hostname or exposes DSM APIs")
 	}
 	p.Target.Host = "192.168.1.20"

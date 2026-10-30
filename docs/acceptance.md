@@ -9,7 +9,7 @@ coverage of every DSM model or a completed stable v0.1 release.
 - Authentication prerequisite fixed in DNSACME PR #114 (5fd54c2, 6844d62),
   package 1.0.9-19 / UI121. Anonymous config returns 401. Original settings,
   trusted device, ACME account and certificate/key checksums survived upgrade.
-- Independent private repository/history, React/TypeScript production build,
+- Independent repository/history, React/TypeScript production build,
   light/dark UI, native DSM AppWindow and transparent native icons.
 - Full Go race tests, vet, TypeScript check and native-token → package CSRF API
   client checks. Management routes, including backup/restore, reject anonymous,
@@ -66,22 +66,21 @@ coverage of every DSM model or a completed stable v0.1 release.
   NAS web services and were not toggled for this check.
 - Live ARM64 and additional DSM models/versions.
 
-## Current services
+## Validated service roles
 
-| Host | Actual target | State |
+Deployment hostnames and custom management ports are omitted from this public-facing
+log. These are roles from the live test deployment, not bundled application defaults.
+
+| Service | Target type | State |
 | --- | --- | --- |
-| syno.example.net | HTTPS 127.0.0.1:5001 | Ready; new SynoHarbor certificate |
-| plex.syno.example.net | HTTP 127.0.0.1:32400 | Ready |
-| qbit.syno.example.net | HTTP 127.0.0.1:8095 | Ready |
-| harbor.syno.example.net | Fixed local package paths through native HTTPS | Ready; independent certificate and proxy |
-
-Kopia was removed from scope and its queued profile deleted at the user's request.
-It was not started, issued a certificate or reintroduced. The imported Cloudflare
-credential was removed; only the user's SynoHarbor credential is retained.
+| DSM desktop | Local native HTTPS management endpoint | Ready; new SynoHarbor certificate |
+| Media service | Local HTTP upstream | Ready |
+| Torrent service | Local HTTP upstream | Ready |
+| SynoHarbor standalone | Fixed local package paths through native HTTPS | Ready; independent certificate and proxy |
 
 ## Standalone access validation (2026-10-29)
 
-- Fresh production certificate and native proxy for `harbor.syno.example.net`
+- Fresh production certificate and native proxy for the standalone hostname
   deployed through the shared Settings/CLI service workflow. Four HTTPS routes
   returned 200 with successful TLS verification; standalone HTTP returned 308.
   No permanent DNS records were changed.
@@ -103,7 +102,8 @@ credential was removed; only the user's SynoHarbor credential is retained.
 ## Standalone/DSM TLS regression and upgrade repair
 
 The new standalone route initially exposed an nginx upstream-session collision:
-both routes used literal 127.0.0.1:5001 with different SNI/verification policies.
+both routes used the same local native HTTPS endpoint with different
+SNI/verification policies.
 Some DSM requests resumed the default certificate and returned 502, leaving a
 partially loaded desktop. Verification was kept enabled. Owned HTTPS upstreams
 now disable session reuse; the permanent fix is installed in preview 0.1.0-16.
